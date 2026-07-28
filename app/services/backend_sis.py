@@ -25,7 +25,7 @@ class BackendSisError(RuntimeError):
 
 
 def _base_url() -> str:
-    base = get_settings().backend_sis_base_url.strip().rstrip("/")
+    base = get_settings().integration_base_url
     if not base:
         raise BackendSisError("Processing is not configured (backend_sis_base_url is empty).")
     return base

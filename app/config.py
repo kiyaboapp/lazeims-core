@@ -13,6 +13,16 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# ── ExaMetrics (backend-sis) processing engine ────────────────────────────────
+# The shared results-processing service. LAZEIMS collects; ExaMetrics processes.
+# The host is baked in as a sensible production default so processing works out
+# of the box; override BACKEND_SIS_BASE_URL per environment if needed.
+EXAMETRICS_DEFAULT_BASE_URL = "https://api.shuleyetu.co.tz"
+# Path where the ExaMetrics integration API is mounted (see backend-sis main.py:
+# exametrics_router at /api/exametrics/v1, integration router prefix /integration).
+EXAMETRICS_INTEGRATION_PREFIX = "/api/exametrics/v1"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -33,15 +43,30 @@ class Settings(BaseSettings):
     allowed_cors_origins: str = "http://localhost:3000"
 
     # ExaMetrics (backend-sis) processing integration.
-    # Base URL of the ExaMetrics integration API, e.g.
-    # "https://api.exametrics.example/api/exametrics/v1". Empty disables the
-    # processing/results features (collection-only deployment).
-    backend_sis_base_url: str = ""
+    # Accepts either the bare host ("https://api.shuleyetu.co.tz") or the full
+    # integration URL ("https://api.shuleyetu.co.tz/api/exametrics/v1"); the
+    # integration prefix is normalized in `integration_base_url`. Set to "" to
+    # disable processing/results (collection-only deployment).
+    backend_sis_base_url: str = EXAMETRICS_DEFAULT_BASE_URL
     backend_sis_timeout_seconds: int = 120
 
     @property
     def processing_enabled(self) -> bool:
         return bool(self.backend_sis_base_url.strip())
+
+    @property
+    def integration_base_url(self) -> str:
+        """Fully-qualified ExaMetrics integration base URL (host + prefix).
+
+        Idempotent: appending the prefix only when it is not already present, so
+        both a bare host and a full URL resolve to the same value.
+        """
+        base = self.backend_sis_base_url.strip().rstrip("/")
+        if not base:
+            return ""
+        if base.endswith(EXAMETRICS_INTEGRATION_PREFIX):
+            return base
+        return f"{base}{EXAMETRICS_INTEGRATION_PREFIX}"
 
     session_cookie_name: str = "lazeims_session"
     session_ttl_seconds: int = 43_200
