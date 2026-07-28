@@ -1,13 +1,17 @@
 """Exam phase state machine + readiness computation (Guide §3.3, delivery §4.1).
 
-This delivery implements the collection lifecycle through ``ENTRY_LOCKED`` only.
-``PROCESSING``/``RESULTS_PUBLISHED``/``ARCHIVED`` are reserved enum values with
-no command endpoints here.
+The collection lifecycle plus handoff to ExaMetrics (backend-sis) for processing:
 
-Each transition is an explicit command with server-side preconditions:
-    REGISTRATION  -> ENTRY_OPEN     (requires full readiness)
-    ENTRY_OPEN    -> ENTRY_LOCKED   (lock entry)
-    ENTRY_LOCKED  -> ENTRY_OPEN     (audited correction window)
+    REGISTRATION  -> ENTRY_OPEN        (requires full readiness)
+    ENTRY_OPEN    -> ENTRY_LOCKED      (lock entry)
+    ENTRY_LOCKED  -> ENTRY_OPEN        (audited correction window)
+    ENTRY_LOCKED  -> PROCESSING        (requires a configured processing link)
+    PROCESSING    -> ENTRY_LOCKED      (revert if processing failed / needs edits)
+    PROCESSING    -> RESULTS_PUBLISHED (requires ExaMetrics to report results ready)
+    RESULTS_PUBLISHED -> ARCHIVED      (close the exam out)
+
+Actual data push / processing / results retrieval happen in the integration
+router; this state machine only guards the phase field and its preconditions.
 """
 
 from __future__ import annotations
@@ -30,12 +34,18 @@ from ..models.exam import (
 )
 from ..models.scoring import Question
 
-# Allowed transitions in this delivery.
+# Allowed transitions.
 ALLOWED_TRANSITIONS: dict[ExamPhase, set[ExamPhase]] = {
     ExamPhase.REGISTRATION: {ExamPhase.ENTRY_OPEN},
     ExamPhase.ENTRY_OPEN: {ExamPhase.ENTRY_LOCKED},
-    ExamPhase.ENTRY_LOCKED: {ExamPhase.ENTRY_OPEN},
+    ExamPhase.ENTRY_LOCKED: {ExamPhase.ENTRY_OPEN, ExamPhase.PROCESSING},
+    ExamPhase.PROCESSING: {ExamPhase.ENTRY_LOCKED, ExamPhase.RESULTS_PUBLISHED},
+    ExamPhase.RESULTS_PUBLISHED: {ExamPhase.ARCHIVED},
 }
+
+# Marker written to ExamProcessingLink.last_status once ExaMetrics reports the
+# exam's results are processed and ready to publish.
+RESULTS_READY_STATUS = "RESULTS_READY"
 
 
 @dataclass
@@ -177,4 +187,32 @@ async def assert_transition_allowed(db: AsyncSession, exam: Exam, target: ExamPh
                 RejectionCode.CONFIGURATION_MISMATCH,
                 "Exam is not ready to open entry.",
                 readiness.as_dict(),
+            )
+
+    # Handing off to ExaMetrics requires a configured processing link.
+    if target == ExamPhase.PROCESSING:
+        from ..models.processing import ExamProcessingLink
+
+        link = (
+            await db.execute(select(ExamProcessingLink).where(ExamProcessingLink.exam_id == exam.id))
+        ).scalar_one_or_none()
+        if link is None:
+            raise ValidationError(
+                RejectionCode.CONFIGURATION_MISMATCH,
+                "Processing is not configured for this exam. Add the ExaMetrics exam id and API key first.",
+                {"exam_id": str(exam.id)},
+            )
+
+    # Publishing requires ExaMetrics to have confirmed results are ready.
+    if target == ExamPhase.RESULTS_PUBLISHED:
+        from ..models.processing import ExamProcessingLink
+
+        link = (
+            await db.execute(select(ExamProcessingLink).where(ExamProcessingLink.exam_id == exam.id))
+        ).scalar_one_or_none()
+        if link is None or link.last_status != RESULTS_READY_STATUS:
+            raise ValidationError(
+                RejectionCode.CONFIGURATION_MISMATCH,
+                "Results are not ready to publish yet. Wait until ExaMetrics reports processing complete.",
+                {"exam_id": str(exam.id), "last_status": getattr(link, "last_status", None)},
             )
