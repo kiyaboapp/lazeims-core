@@ -31,6 +31,7 @@ from .collection import (
     CollectionSnapshot,
 )
 from .cross_cutting import AuditLog, Notification
+from .processing import ExamProcessingLink
 from .marks import (
     Attendance,
     ExamIncident,
@@ -78,6 +79,8 @@ __all__ = [
     "CollectionReadinessRun", "CollectionSnapshot", "CollectionExportFile",
     # cross-cutting
     "AuditLog", "Notification",
+    # processing integration
+    "ExamProcessingLink",
     # scoring
     "QuestionGroup", "Question", "QuestionTopic", "ExamConfigurationVersion",
     # assignments / scope

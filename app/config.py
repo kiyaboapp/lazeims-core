@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     zone_name: str = ""
     allowed_cors_origins: str = "http://localhost:3000"
 
+    # ExaMetrics (backend-sis) processing integration.
+    # Base URL of the ExaMetrics integration API, e.g.
+    # "https://api.exametrics.example/api/exametrics/v1". Empty disables the
+    # processing/results features (collection-only deployment).
+    backend_sis_base_url: str = ""
+    backend_sis_timeout_seconds: int = 120
+
+    @property
+    def processing_enabled(self) -> bool:
+        return bool(self.backend_sis_base_url.strip())
+
     session_cookie_name: str = "lazeims_session"
     session_ttl_seconds: int = 43_200
     session_cookie_secure: bool = False

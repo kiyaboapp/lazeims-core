@@ -22,6 +22,7 @@ from .routers import auth as auth_router
 from .routers import closeout as closeout_router
 from .routers import excel as excel_router
 from .routers import exams as exams_router
+from .routers import integration as integration_router
 from .routers import marks as marks_router
 from .routers import notifications as notifications_router
 from .routers import routers_registry as registry_router
@@ -91,6 +92,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router.router, prefix=API_PREFIX)
     app.include_router(registry_router.router, prefix=API_PREFIX)
     app.include_router(exams_router.router, prefix=API_PREFIX)
+    app.include_router(integration_router.router, prefix=API_PREFIX)
     app.include_router(marks_router.router, prefix=API_PREFIX)
     app.include_router(stations_router.router, prefix=API_PREFIX)
     app.include_router(station_sync_router.router, prefix=API_PREFIX)
