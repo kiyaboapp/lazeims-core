@@ -25,7 +25,7 @@ from ..deps import current_user
 from ..deps_exam import require_exam_admin
 from ..models.exam import Exam
 from ..models.processing import ExamProcessingLink
-from ..models.registry import User
+from ..models.registry import ExamLevel, User
 from ..schemas_exam import ExamOut
 from ..services import backend_sis
 from ..services.backend_sis import BackendSisError
@@ -45,6 +45,19 @@ class ProcessingLinkOut(BaseModel):
     backend_exam_id: str | None = None
     last_submitted_at: datetime | None = None
     last_status: str | None = None
+    # Whether this deployment can obtain a key itself, or needs one pasted in.
+    can_self_provision: bool = False
+
+
+class ProvisionOut(BaseModel):
+    """Outcome of provisioning a key with ExaMetrics."""
+
+    backend_exam_id: str
+    exam_created: bool
+    requested_scopes: list[str] = Field(default_factory=list)
+    usable_scopes: list[str] = Field(default_factory=list)
+    approval_status: str
+    approval_note: str | None = None
 
 
 async def _get_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
@@ -52,6 +65,18 @@ async def _get_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
     if exam is None:
         raise HTTPException(404, "Exam not found")
     return exam
+
+
+# LAZEIMS exam levels are registry rows; ExaMetrics uses a fixed enum. Only these
+# levels can be processed there.
+_EXAMETRICS_LEVELS = {"STNA", "SFNA", "PSLE", "FTNA", "CSEE", "ACSEE"}
+
+
+def _exametrics_level(level_name: str | None) -> str | None:
+    if not level_name:
+        return None
+    candidate = level_name.strip().upper()
+    return candidate if candidate in _EXAMETRICS_LEVELS else None
 
 
 async def _get_link(db: AsyncSession, exam_id: uuid.UUID) -> ExamProcessingLink | None:
@@ -93,14 +118,110 @@ def _sis_http(exc: BackendSisError) -> HTTPException:
 async def get_processing_link(
     exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), _: User = Depends(current_user)
 ):
+    can_provision = get_settings().provisioning_enabled
     link = await _get_link(db, exam_id)
     if link is None:
-        return ProcessingLinkOut(configured=False)
+        return ProcessingLinkOut(configured=False, can_self_provision=can_provision)
     return ProcessingLinkOut(
         configured=True,
         backend_exam_id=link.backend_exam_id,
         last_submitted_at=link.last_submitted_at,
         last_status=link.last_status,
+        can_self_provision=can_provision,
+    )
+
+
+@router.post("/{exam_id}/processing/provision", response_model=ProvisionOut)
+async def provision_processing_link(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+):
+    """Register this exam with ExaMetrics and store the key it issues.
+
+    Replaces pasting a key in by hand: the zone enrolment secret lets this server
+    obtain a per-exam key directly. Safe to call again to rotate the key — the
+    ExaMetrics side is idempotent on our exam id and carries any existing
+    approval forward.
+
+    The key is usable for pushing collected data immediately. Processing and
+    results stay ``PENDING`` until ExaMetrics approves them, which is reported in
+    the response rather than failing.
+    """
+    settings = get_settings()
+    if not settings.provisioning_enabled:
+        raise HTTPException(
+            503,
+            detail={
+                "code": "PROVISIONING_DISABLED",
+                "message": (
+                    "This deployment has no ExaMetrics enrolment secret configured. "
+                    "Enter a purchased key manually instead."
+                ),
+            },
+        )
+
+    exam = await _get_exam(db, exam_id)
+    level = await db.get(ExamLevel, exam.level_id)
+    exametrics_level = _exametrics_level(level.name if level else None)
+    if exametrics_level is None:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "LEVEL_NOT_MAPPED",
+                "message": (
+                    f"Exam level {level.name if level else 'unknown'!r} has no ExaMetrics "
+                    "equivalent, so this exam cannot be processed there."
+                ),
+            },
+        )
+
+    try:
+        result = await backend_sis.provision_exam(
+            external_exam_id=str(exam.id),
+            exam_name=exam.name,
+            exam_level=exametrics_level,
+            board_id=settings.backend_sis_board_id or None,
+            start_date=exam.start_date.isoformat() if exam.start_date else None,
+            end_date=exam.end_date.isoformat() if exam.end_date else None,
+            partner_label=settings.backend_sis_partner_label,
+        )
+    except BackendSisError as exc:
+        raise _sis_http(exc)
+
+    api_key = str(result.get("api_key") or "").strip()
+    backend_exam_id = str(result.get("exam_id") or "").strip()
+    if not api_key or not backend_exam_id:
+        raise HTTPException(
+            502,
+            detail={
+                "code": "EXAMETRICS_ERROR",
+                "message": "ExaMetrics did not return a key for this exam.",
+            },
+        )
+
+    link = await _get_link(db, exam_id)
+    if link is None:
+        link = ExamProcessingLink(
+            exam_id=exam_id,
+            backend_exam_id=backend_exam_id,
+            api_key=api_key,
+            configured_by=user.id,
+        )
+        db.add(link)
+    else:
+        link.backend_exam_id = backend_exam_id
+        link.api_key = api_key
+        link.configured_by = user.id
+    await db.flush()
+
+    return ProvisionOut(
+        backend_exam_id=backend_exam_id,
+        exam_created=bool(result.get("exam_created")),
+        requested_scopes=list(result.get("requested_scopes") or []),
+        usable_scopes=list(result.get("usable_scopes") or []),
+        approval_status=str(result.get("approval_status") or "UNKNOWN"),
+        approval_note=result.get("approval_note"),
     )
 
 

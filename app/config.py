@@ -39,9 +39,23 @@ class Settings(BaseSettings):
     backend_sis_base_url: str = ""
     backend_sis_timeout_seconds: int = 120
 
+    # Zone enrolment secret, issued by ExaMetrics once per zone. Lets this server
+    # self-provision a per-exam key when an exam is created, instead of an admin
+    # pasting one in by hand. Server-side only; never sent to a browser.
+    backend_sis_provision_secret: str = ""
+    # Which ExaMetrics board new exams are provisioned under (first call only).
+    backend_sis_board_id: str = ""
+    # Label ExaMetrics shows against keys provisioned by this deployment.
+    backend_sis_partner_label: str = "LAZEIMS"
+
     @property
     def processing_enabled(self) -> bool:
         return bool(self.backend_sis_base_url.strip())
+
+    @property
+    def provisioning_enabled(self) -> bool:
+        """Self-provisioning needs a base URL and the zone enrolment secret."""
+        return self.processing_enabled and bool(self.backend_sis_provision_secret.strip())
 
     session_cookie_name: str = "lazeims_session"
     session_ttl_seconds: int = 43_200

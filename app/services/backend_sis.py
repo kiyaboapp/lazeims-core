@@ -81,6 +81,57 @@ async def extract_registrations(filename: str, content: bytes, content_type: str
         return _unwrap(resp)
 
 
+async def provision_exam(
+    *,
+    external_exam_id: str,
+    exam_name: str,
+    exam_level: str,
+    board_id: str | None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    scopes: list[str] | None = None,
+    partner_label: str = "LAZEIMS",
+) -> dict:
+    """Register this exam with ExaMetrics and obtain its per-exam API key.
+
+    Authenticated by the zone enrolment secret, not by an API key — this is how
+    the first key for an exam is obtained. Idempotent on ``external_exam_id``, so
+    calling it again rotates the key rather than creating a duplicate exam.
+
+    The returned key can push collected data immediately; processing and results
+    scopes come back as ``PENDING`` until ExaMetrics approves them.
+    """
+    settings = get_settings()
+    secret = settings.backend_sis_provision_secret.strip()
+    if not secret:
+        raise BackendSisError(
+            "Self-provisioning is not configured (backend_sis_provision_secret is empty)."
+        )
+
+    body: dict[str, Any] = {
+        "external_exam_id": external_exam_id,
+        "exam_name": exam_name,
+        "exam_level": exam_level,
+        "partner_label": partner_label,
+    }
+    if board_id:
+        body["board_id"] = board_id
+    if start_date:
+        body["start_date"] = start_date
+    if end_date:
+        body["end_date"] = end_date
+    if scopes is not None:
+        body["scopes"] = scopes
+
+    async with httpx.AsyncClient(
+        base_url=_base_url(),
+        headers={"X-Provision-Secret": secret},
+        timeout=settings.backend_sis_timeout_seconds,
+    ) as client:
+        resp = await client.post("/integration/provision", json=body)
+        return _unwrap(resp)
+
+
 async def push_collection(api_key: str, backend_exam_id: str, payload: dict) -> Any:
     async with _client(api_key) as client:
         resp = await client.post(f"/integration/exams/{backend_exam_id}/collection", json=payload)
