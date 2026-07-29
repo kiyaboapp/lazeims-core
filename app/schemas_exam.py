@@ -50,6 +50,34 @@ class ExamOut(ORMModel):
     current_configuration_version: int | None
 
 
+class ExamSettingsPatch(BaseModel):
+    """Partial settings update. Every field optional so a caller can change one
+    setting without restating the rest."""
+
+    model_config = ConfigDict(extra="forbid")
+    has_theory2: bool | None = None
+    has_practical: bool | None = None
+    has_filling_station: bool | None = None
+    filling_mode: str | None = None   # TOTAL_MARKS | ITEM_LEVEL
+    display_mode: str | None = None   # NAME | ID_ONLY
+
+
+class ExamPatch(BaseModel):
+    """Partial exam update.
+
+    ``phase`` is intentionally absent: it moves only through the transitions
+    endpoint, which enforces the state machine and its preconditions.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    level_id: int | None = None
+    board_id: int | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    settings: ExamSettingsPatch | None = None
+
+
 class PhaseTransitionIn(BaseModel):
     target_phase: ExamPhase
     reason: str | None = None  # required for ENTRY_LOCKED -> ENTRY_OPEN reopen

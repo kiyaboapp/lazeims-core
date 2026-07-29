@@ -44,6 +44,7 @@ from ..schemas_exam import (
     DataEntererScopeIn,
     ExamIn,
     ExamOut,
+    ExamPatch,
     ExamSchoolIn,
     ExamStudentIn,
     ExamStudentOut,
@@ -59,6 +60,7 @@ from ..schemas_exam import (
     WriterAssignmentOut,
 )
 from ..schemas_registry import PaginatedResponse
+from ..services.collection_progress import collection_progress
 from ..services.exam_config import seal_configuration_version, validate_subject_scoring
 from ..services.exam_phase import (
     assert_transition_allowed,
@@ -187,9 +189,59 @@ async def transition_phase(
 # ---- filling progress ----
 
 @router.get("/{exam_id}/filling-progress")
-async def get_filling_progress(exam_id: uuid.UUID, _: User = Depends(current_user)):
-    """Stub: returns empty list until marks processing integration is live."""
-    return []
+async def get_filling_progress(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(current_user),
+):
+    """Per-scope collection progress.
+
+    Kept at this path for backward compatibility, but it now returns the real
+    progress payload instead of an empty list: expected vs entered counts,
+    attendance transcription, finalization state and the specific blockers per
+    (school, subject, paper) scope.
+    """
+    exam = await _get_exam(db, exam_id)
+    return await collection_progress(db, exam=exam)
+
+
+@router.patch("/{exam_id}", response_model=ExamOut)
+async def update_exam(
+    exam_id: uuid.UUID,
+    payload: ExamPatch,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+):
+    """Update exam metadata and collection settings.
+
+    Settings govern how marks are validated, so they are only mutable during
+    REGISTRATION — the same rule the rest of the configuration follows. `phase`
+    is deliberately not patchable: it moves only through
+    ``POST /exams/{id}/transitions``, which enforces its preconditions.
+    """
+    exam = await _get_exam(db, exam_id)
+    updates = payload.model_dump(exclude_unset=True)
+
+    settings_update = updates.pop("settings", None)
+    if settings_update is not None:
+        _require_registration_phase(exam)
+        # Merge rather than replace, so a partial patch cannot silently drop
+        # settings the client did not send.
+        exam.settings = {**(exam.settings or {}), **settings_update}
+
+    if updates:
+        # Renaming or re-dating an exam is safe at any phase; changing its level
+        # is not, because subjects and candidates are already bound to it.
+        if "level_id" in updates and updates["level_id"] != exam.level_id:
+            _require_registration_phase(exam)
+        for key, value in updates.items():
+            setattr(exam, key, value)
+
+    try:
+        await db.flush()
+    except IntegrityError:
+        raise HTTPException(409, "exam name already exists")
+    return ExamOut.model_validate(exam)
 
 
 # ---- schools ----
