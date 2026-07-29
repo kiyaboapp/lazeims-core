@@ -61,6 +61,21 @@ class ExamSchoolIn(BaseModel):
     school_id: int
 
 
+class BulkExamSchoolIn(BaseModel):
+    """Bulk school enrollment.
+
+    Either supply explicit ``school_ids``, or supply a geography filter to
+    enroll every eligible school in that area. The most specific geography
+    filter provided wins (ward > council > region).
+    """
+
+    school_ids: list[int] = Field(default_factory=list)
+    region_id: int | None = None
+    council_id: int | None = None
+    ward_id: int | None = None
+    school_type: str | None = None
+
+
 class ExamSubjectIn(BaseModel):
     subject_id: int
     has_theory2: bool = False

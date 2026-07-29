@@ -66,6 +66,25 @@ router = APIRouter(prefix="/registry", tags=["registry"])
 
 _ADMIN = require_role(StandingRoleName.SUPER_ADMIN, StandingRoleName.SYSTEM_ADMIN)
 
+# Which school level sits each exam. Centre-number prefixes encode the level:
+# ``PS…`` = primary, ``S…`` = secondary.
+_EXAM_LEVEL_TO_SCHOOL_LEVEL = {
+    "SFNA": "PRIMARY",
+    "PSLE": "PRIMARY",
+    "FTNA": "SECONDARY",
+    "CSEE": "SECONDARY",
+    "ACSEE": "SECONDARY",
+}
+
+# Which subject flag is relevant for each exam level.
+_EXAM_LEVEL_TO_SUBJECT_FLAG = {
+    "SFNA": "is_primary",
+    "PSLE": "is_primary",
+    "FTNA": "is_olevel",
+    "CSEE": "is_olevel",
+    "ACSEE": "is_alevel",
+}
+
 
 def _validation_http(exc: ValidationError) -> HTTPException:
     return HTTPException(
@@ -365,6 +384,16 @@ async def list_schools(
     council_id: int | None = Query(None),
     ward_id: int | None = Query(None),
     school_type: str | None = Query(None),
+    school_level: str | None = Query(
+        None,
+        description="PRIMARY or SECONDARY — derived from the centre-number prefix "
+                    "(PS… = primary, S… = secondary).",
+    ),
+    exam_level: str | None = Query(
+        None,
+        description="Exam level (SFNA|PSLE|FTNA|CSEE|ACSEE). Restricts results to "
+                    "the school level that sits that exam.",
+    ),
     db: AsyncSession = Depends(get_session),
     _: User = Depends(current_user),
 ):
@@ -377,6 +406,19 @@ async def list_schools(
         stmt = stmt.where(School.ward_id == ward_id)
     if school_type:
         stmt = stmt.where(School.school_type == school_type)
+
+    # Resolve an exam level into the school level that sits it.
+    level = (school_level or "").upper() or None
+    if level is None and exam_level:
+        level = _EXAM_LEVEL_TO_SCHOOL_LEVEL.get(exam_level.upper())
+    if level == "PRIMARY":
+        stmt = stmt.where(School.centre_number.ilike("PS%"))
+    elif level == "SECONDARY":
+        # 'S…' but never 'PS…' — the PS prefix is primary.
+        stmt = stmt.where(
+            School.centre_number.ilike("S%") & ~School.centre_number.ilike("PS%")
+        )
+
     if search:
         stmt = stmt.where(
             School.name.ilike(f"%{search}%") | School.centre_number.ilike(f"%{search}%")
@@ -484,10 +526,19 @@ async def list_subjects(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     search: str = Query("", max_length=160),
+    exam_level: str | None = Query(
+        None,
+        description="Exam level (SFNA|PSLE|FTNA|CSEE|ACSEE). Restricts results to "
+                    "subjects offered at that level.",
+    ),
     db: AsyncSession = Depends(get_session),
     _: User = Depends(current_user),
 ):
     stmt = select(Subject)
+    if exam_level:
+        flag = _EXAM_LEVEL_TO_SUBJECT_FLAG.get(exam_level.upper())
+        if flag:
+            stmt = stmt.where(getattr(Subject, flag).is_(True))
     if search:
         stmt = stmt.where(
             Subject.name.ilike(f"%{search}%") | Subject.code.ilike(f"%{search}%")

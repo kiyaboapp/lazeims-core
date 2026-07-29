@@ -40,6 +40,7 @@ from ..models.exam import (
 from ..models.registry import User
 from ..models.scoring import Question, QuestionGroup, QuestionTopic
 from ..schemas_exam import (
+    BulkExamSchoolIn,
     DataEntererScopeIn,
     ExamIn,
     ExamOut,
@@ -193,8 +194,35 @@ async def get_filling_progress(exam_id: uuid.UUID, _: User = Depends(current_use
 
 @router.get("/{exam_id}/schools")
 async def list_exam_schools(exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), _: User = Depends(current_user)):
-    rows = (await db.execute(select(ExamSchool).where(ExamSchool.exam_id == exam_id))).scalars().all()
-    return [{"id": r.id, "school_id": r.school_id} for r in rows]
+    """Enrolled schools for an exam, enriched with registry identity.
+
+    Returns the school name/centre inline so the client never has to bulk-load
+    the whole school registry just to render this list.
+    """
+    from ..models.registry import School as _School
+
+    rows = (
+        await db.execute(
+            select(
+                ExamSchool.id,
+                ExamSchool.school_id,
+                _School.name,
+                _School.centre_number,
+            )
+            .join(_School, _School.id == ExamSchool.school_id)
+            .where(ExamSchool.exam_id == exam_id)
+            .order_by(_School.centre_number)
+        )
+    ).all()
+    return [
+        {
+            "id": r.id,
+            "school_id": r.school_id,
+            "school_name": r.name,
+            "centre_number": r.centre_number,
+        }
+        for r in rows
+    ]
 
 
 @router.post("/{exam_id}/schools", status_code=201)
@@ -211,6 +239,82 @@ async def attach_school(
     except IntegrityError:
         raise HTTPException(409, "school already attached")
     return {"id": row.id, "school_id": row.school_id}
+
+
+@router.post("/{exam_id}/schools/bulk", status_code=201)
+async def bulk_enroll_schools(
+    exam_id: uuid.UUID,
+    payload: BulkExamSchoolIn,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+):
+    """Enroll many schools at once.
+
+    Either pass explicit ``school_ids``, or pass a geography filter
+    (``region_id`` / ``council_id`` / ``ward_id``) to enroll every school in
+    that area. Schools are always constrained to the level that sits this
+    exam, and already-enrolled schools are skipped (idempotent).
+    """
+    from ..models.registry import ExamLevel as _ExamLevel, School as _School
+
+    exam = await _get_exam(db, exam_id)
+    _require_registration_phase(exam)
+
+    if not payload.school_ids and not any(
+        (payload.region_id, payload.council_id, payload.ward_id)
+    ):
+        raise HTTPException(422, "Provide school_ids or a region/council/ward filter.")
+
+    stmt = select(_School.id)
+
+    if payload.school_ids:
+        stmt = stmt.where(_School.id.in_(payload.school_ids))
+    else:
+        if payload.ward_id is not None:
+            stmt = stmt.where(_School.ward_id == payload.ward_id)
+        elif payload.council_id is not None:
+            stmt = stmt.where(_School.council_id == payload.council_id)
+        elif payload.region_id is not None:
+            stmt = stmt.where(_School.region_id == payload.region_id)
+
+    # Constrain to the school level that sits this exam.
+    level = await db.get(_ExamLevel, exam.level_id)
+    level_name = (level.name or "").upper() if level else ""
+    if level_name in ("SFNA", "PSLE"):
+        stmt = stmt.where(_School.centre_number.ilike("PS%"))
+    elif level_name in ("FTNA", "CSEE", "ACSEE"):
+        stmt = stmt.where(
+            _School.centre_number.ilike("S%") & ~_School.centre_number.ilike("PS%")
+        )
+
+    if payload.school_type:
+        stmt = stmt.where(_School.school_type == payload.school_type)
+
+    candidate_ids = set((await db.execute(stmt)).scalars().all())
+    if not candidate_ids:
+        return {"enrolled": 0, "skipped": 0, "total_matched": 0}
+
+    already = set(
+        (
+            await db.execute(
+                select(ExamSchool.school_id).where(
+                    ExamSchool.exam_id == exam_id,
+                    ExamSchool.school_id.in_(candidate_ids),
+                )
+            )
+        ).scalars().all()
+    )
+
+    to_add = candidate_ids - already
+    for school_id in to_add:
+        db.add(ExamSchool(exam_id=exam_id, school_id=school_id))
+    await db.flush()
+
+    return {
+        "enrolled": len(to_add),
+        "skipped": len(already),
+        "total_matched": len(candidate_ids),
+    }
 
 
 # ---- subjects ----
