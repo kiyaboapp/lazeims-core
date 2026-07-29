@@ -486,6 +486,112 @@ async def apply_rows(
 # ──────────────────────────────── stats ─────────────────────────────────
 
 
+def rows_from_extract(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten an ExaMetrics extraction envelope into per-centre groups.
+
+    ExaMetrics' ``POST /integration/registrations/extract`` returns one document
+    per PDF — a ZIP of registers therefore yields many centres in one upload.
+    Its rows are already normalised (``student_id``, ``first_name``,
+    ``middle_name``, ``surname``, ``sex``, ``combination``, ``subject_codes``),
+    so nothing needs guessing from column headers.
+
+    Returns ``[{centre_number, school_name, exam_level, exam_year, source,
+    parse_error, rows[]}]`` — one entry per document, preserving failures so the
+    caller can report which register in a ZIP could not be read.
+    """
+    groups: list[dict[str, Any]] = []
+
+    for document in payload.get("documents") or []:
+        source = document.get("source")
+
+        # A document that failed to parse carries `error` instead of `school`.
+        if document.get("error"):
+            groups.append(
+                {
+                    "source": source,
+                    "centre_number": None,
+                    "school_name": None,
+                    "exam_level": None,
+                    "exam_year": None,
+                    "parse_error": str(document["error"]),
+                    "rows": [],
+                }
+            )
+            continue
+
+        school = document.get("school") or {}
+        rows: list[dict[str, Any]] = []
+        for raw in document.get("rows") or []:
+            rows.append(
+                {
+                    "student_id": _norm(raw.get("student_id")),
+                    "first_name": _norm(raw.get("first_name")),
+                    "middle_name": _norm(raw.get("middle_name")) or None,
+                    "surname": _norm(raw.get("surname")),
+                    "sex": _norm(raw.get("sex")),
+                    "combination": _norm(raw.get("combination")) or None,
+                    "subject_codes": [
+                        _norm(code).upper()
+                        for code in (raw.get("subject_codes") or [])
+                        if _norm(code)
+                    ],
+                }
+            )
+
+        groups.append(
+            {
+                "source": source,
+                "centre_number": _norm(school.get("centre_number")).upper() or None,
+                "school_name": _norm(school.get("school_name")) or None,
+                "exam_level": _norm(school.get("exam_level")) or None,
+                "exam_year": _norm(school.get("exam_year")) or None,
+                "parse_error": None,
+                "rows": rows,
+            }
+        )
+
+    return groups
+
+
+async def resolve_centres(
+    db: AsyncSession, *, exam_id, centre_numbers: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    """Map centre number → registry school and whether it is enrolled in the exam.
+
+    A register names its centre; LAZEIMS keys candidates by ``school_id``. This
+    is the join, done once for a whole batch.
+    """
+    wanted = {c.upper() for c in centre_numbers if c}
+    if not wanted:
+        return {}
+
+    rows = (
+        await db.execute(
+            select(School.id, School.centre_number, School.name).where(
+                func.upper(School.centre_number).in_(wanted)
+            )
+        )
+    ).all()
+
+    enrolled = set(
+        (
+            await db.execute(
+                select(ExamSchool.school_id).where(ExamSchool.exam_id == exam_id)
+            )
+        ).scalars().all()
+    )
+
+    return {
+        str(centre).upper(): {
+            "school_id": school_id,
+            "centre_number": centre,
+            "school_name": name,
+            "enrolled": school_id in enrolled,
+        }
+        for school_id, centre, name in rows
+    }
+
+
 async def registration_stats(db: AsyncSession, *, exam_id) -> dict[str, Any]:
     """Per-school candidate counts, so the UI can show registration progress
     without pulling every candidate."""

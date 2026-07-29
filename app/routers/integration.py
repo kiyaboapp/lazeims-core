@@ -275,24 +275,6 @@ async def download_rawdata(
     )
 
 
-# ── Free registration extraction (PDF/ZIP → rows) ────────────────────────────
-@router.post("/{exam_id}/registrations/extract")
-async def extract_registrations(
-    exam_id: uuid.UUID,
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_session),
-    user: User = Depends(require_exam_admin()),
-):
-    """Extract student registrations from an uploaded PDF/ZIP via ExaMetrics.
-    Nothing is stored in ExaMetrics; the parsed rows are returned so Central can
-    register the students itself."""
-    link = await _require_link(db, exam_id)
-    content = await file.read()
-    if not content:
-        raise HTTPException(400, "Empty file")
-    try:
-        return await backend_sis.extract_registrations(
-            link.api_key, file.filename or "upload", content, file.content_type or "application/octet-stream"
-        )
-    except BackendSisError as exc:
-        raise _sis_http(exc)
+# Registration extraction moved to the registration router: it is keyless
+# upstream and belongs to the registration stage, not to processing.
+# See POST /exams/{exam_id}/registration/extract.

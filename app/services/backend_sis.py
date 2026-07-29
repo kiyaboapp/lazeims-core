@@ -31,10 +31,11 @@ def _base_url() -> str:
     return base
 
 
-def _client(api_key: str) -> httpx.AsyncClient:
+def _client(api_key: str | None) -> httpx.AsyncClient:
+    """`api_key` is None for the keyless endpoints (registration extraction)."""
     return httpx.AsyncClient(
         base_url=_base_url(),
-        headers={"X-API-Key": api_key},
+        headers={"X-API-Key": api_key} if api_key else {},
         timeout=get_settings().backend_sis_timeout_seconds,
     )
 
@@ -61,9 +62,18 @@ def _unwrap(resp: httpx.Response) -> Any:
         return resp.content
 
 
-async def extract_registrations(api_key: str, filename: str, content: bytes, content_type: str) -> Any:
-    """Free PDF/ZIP → rows extraction. Nothing is persisted in ExaMetrics."""
-    async with _client(api_key) as client:
+async def extract_registrations(filename: str, content: bytes, content_type: str) -> Any:
+    """Parse a registration PDF / ZIP-of-PDFs into structured schools, subjects,
+    students and per-student subject registrations.
+
+    Upstream this endpoint is explicitly **free and keyless** — it never touches
+    the ExaMetrics database. So it takes no API key and needs no processing link:
+    a zone can extract registers long before it buys processing.
+
+    Returns the ExaMetrics ``documents`` envelope; see
+    :func:`app.services.registration_import.rows_from_extract` for the shape.
+    """
+    async with _client(None) as client:
         resp = await client.post(
             "/integration/registrations/extract",
             files={"file": (filename, content, content_type or "application/octet-stream")},

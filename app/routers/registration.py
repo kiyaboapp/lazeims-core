@@ -28,7 +28,8 @@ from ..deps import current_user
 from ..deps_exam import require_exam_admin
 from ..models.exam import Exam
 from ..models.registry import School, User
-from ..services import registration_import
+from ..services import backend_sis, registration_import
+from ..services.backend_sis import BackendSisError
 
 router = APIRouter(prefix="/exams", tags=["registration"])
 
@@ -49,12 +50,27 @@ async def _get_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
     return exam
 
 
-def _require_registration_phase(exam: Exam) -> None:
-    if exam.phase != ExamPhase.REGISTRATION:
+def _require_registration_open(exam: Exam) -> None:
+    """Registration stays open for corrections at every live phase.
+
+    Rosters are corrected in the real world long after entry opens — a candidate
+    was omitted, a name was wrong, a centre sent a late register. Locking
+    registration to the REGISTRATION phase (as configuration is locked) would
+    make those corrections impossible and push people into editing the database
+    by hand.
+
+    So the only closed state is ARCHIVED. Edits made outside REGISTRATION are
+    recorded in the audit log by the caller, and the marks-affecting parts of the
+    configuration (papers, maxima, filling mode) remain locked separately.
+    """
+    if exam.phase == ExamPhase.ARCHIVED:
         raise HTTPException(
-            409,
-            f"Candidates can only be registered in REGISTRATION; exam is {exam.phase.value}.",
+            409, "This exam is archived and read-only. Reopen it before editing registrations."
         )
+
+
+def _outside_registration(exam: Exam) -> bool:
+    return exam.phase != ExamPhase.REGISTRATION
 
 
 # ─────────────────────────────── schemas ────────────────────────────────
@@ -139,7 +155,7 @@ async def preview_register_upload(
     ``/students/bulk`` once the operator has reviewed them.
     """
     exam = await _get_exam(db, exam_id)
-    _require_registration_phase(exam)
+    _require_registration_open(exam)
     content = await file.read()
     try:
         raw_rows = registration_import.parse_register_file(content, file.filename or "upload")
@@ -160,7 +176,7 @@ async def preview_register_rows(
     """Validate rows supplied as JSON — used for the PDF/ZIP extract path and
     for hand-corrected rows coming back from the review table."""
     exam = await _get_exam(db, exam_id)
-    _require_registration_phase(exam)
+    _require_registration_open(exam)
     try:
         return await registration_import.validate_rows(
             db,
@@ -186,7 +202,7 @@ async def bulk_register_students(
     payload cannot bypass validation.
     """
     exam = await _get_exam(db, exam_id)
-    _require_registration_phase(exam)
+    _require_registration_open(exam)
     try:
         return await registration_import.apply_rows(
             db,
@@ -196,6 +212,185 @@ async def bulk_register_students(
         )
     except ValidationError as exc:
         raise _vhttp(exc)
+
+
+@router.post("/{exam_id}/registration/extract")
+async def extract_registration_document(
+    exam_id: uuid.UUID,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+) -> dict[str, Any]:
+    """Parse a registration PDF, or a ZIP of PDFs, into per-centre candidate lists.
+
+    Proxies ExaMetrics' parser, which is free and keyless — **no processing link
+    or purchased API key is required**, so a zone can import registers long
+    before it buys results processing.
+
+    One PDF is one centre's register, so a ZIP returns many centres. For each
+    document the response reports the centre, whether that centre exists in the
+    registry and is enrolled in this exam, and the validated candidate rows.
+    Nothing is written; post the rows to ``/registration/ingest`` to apply them.
+    """
+    exam = await _get_exam(db, exam_id)
+    _require_registration_open(exam)
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "Empty file")
+
+    try:
+        payload = await backend_sis.extract_registrations(
+            file.filename or "upload",
+            content,
+            file.content_type or "application/octet-stream",
+        )
+    except BackendSisError as exc:
+        raise HTTPException(
+            502,
+            detail={
+                "code": "EXAMETRICS_ERROR",
+                "message": str(exc),
+                "upstream_status": exc.status_code,
+            },
+        )
+
+    groups = registration_import.rows_from_extract(payload)
+    centres = await registration_import.resolve_centres(
+        db, exam_id=exam_id, centre_numbers=[g["centre_number"] for g in groups if g["centre_number"]]
+    )
+
+    documents: list[dict[str, Any]] = []
+    for group in groups:
+        centre_key = (group["centre_number"] or "").upper()
+        match = centres.get(centre_key)
+
+        entry: dict[str, Any] = {
+            "source": group["source"],
+            "centre_number": group["centre_number"],
+            "school_name_in_document": group["school_name"],
+            "exam_level": group["exam_level"],
+            "exam_year": group["exam_year"],
+            "parse_error": group["parse_error"],
+            "row_count": len(group["rows"]),
+            "school_id": match["school_id"] if match else None,
+            "registry_school_name": match["school_name"] if match else None,
+            "enrolled": bool(match and match["enrolled"]),
+            "preview": None,
+        }
+
+        # Validate against the exam only when we can place the centre.
+        if match and match["enrolled"] and group["rows"]:
+            entry["preview"] = await registration_import.validate_rows(
+                db, exam=exam, school_id=match["school_id"], raw_rows=group["rows"]
+            )
+        elif match and not match["enrolled"]:
+            entry["blocked_reason"] = (
+                f"Centre {group['centre_number']} is in the registry but not enrolled in this "
+                "exam. Enrol it, then re-run the import."
+            )
+        elif group["centre_number"] and not match:
+            entry["blocked_reason"] = (
+                f"Centre {group['centre_number']} is not in the school registry. Add the school "
+                "first."
+            )
+
+        documents.append(entry)
+
+    return {
+        "file_count": payload.get("file_count", len(documents)),
+        "total_rows": payload.get("total_rows", 0),
+        "documents": documents,
+        "phase_warning": (
+            "This exam has moved past Registration. Changes are still allowed for "
+            "corrections and will be recorded in the audit log."
+            if _outside_registration(exam)
+            else None
+        ),
+    }
+
+
+class IngestGroupIn(BaseModel):
+    """One centre's candidates, as reviewed by the operator."""
+
+    school_id: int
+    rows: list[RegisterRowIn] = Field(default_factory=list)
+
+
+class IngestIn(BaseModel):
+    groups: list[IngestGroupIn] = Field(min_length=1)
+
+
+@router.post("/{exam_id}/registration/ingest", status_code=201)
+async def ingest_registrations(
+    exam_id: uuid.UUID,
+    payload: IngestIn,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+) -> dict[str, Any]:
+    """Register candidates for many centres in one call.
+
+    This is the apply step for a ZIP of registers: each group is one centre.
+    Groups are applied independently, so one bad centre does not roll back the
+    rest, and every group is re-validated server-side.
+    """
+    exam = await _get_exam(db, exam_id)
+    _require_registration_open(exam)
+
+    results: list[dict[str, Any]] = []
+    created = skipped = failed = 0
+
+    for group in payload.groups:
+        try:
+            result = await registration_import.apply_rows(
+                db,
+                exam=exam,
+                school_id=group.school_id,
+                rows=[r.model_dump() for r in group.rows],
+            )
+            results.append({"school_id": group.school_id, **result})
+            created += result["created"]
+            skipped += result["skipped"]
+            failed += result["failed"]
+        except ValidationError as exc:
+            results.append(
+                {
+                    "school_id": group.school_id,
+                    "created": 0,
+                    "skipped": 0,
+                    "failed": len(group.rows),
+                    "error": exc.message,
+                }
+            )
+            failed += len(group.rows)
+
+    if _outside_registration(exam):
+        # Corrections after Registration are legitimate but must leave a trail.
+        from ..services import notifications as notif
+
+        await notif.record(
+            db,
+            action="REGISTRATION_CORRECTED",
+            entity_type="exam",
+            entity_id=str(exam_id),
+            actor_id=user.id,
+            exam_id=exam_id,
+            after={
+                "phase": exam.phase.value,
+                "centres": len(payload.groups),
+                "created": created,
+                "skipped": skipped,
+                "failed": failed,
+            },
+        )
+
+    return {
+        "centres": len(results),
+        "created": created,
+        "skipped": skipped,
+        "failed": failed,
+        "results": results,
+    }
 
 
 @router.get("/{exam_id}/registration/stats")

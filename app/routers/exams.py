@@ -84,11 +84,29 @@ async def _get_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
 
 
 def _require_registration_phase(exam: Exam) -> None:
-    """Marks-affecting config changes only allowed in REGISTRATION."""
+    """Marks-affecting config changes only allowed in REGISTRATION.
+
+    Applies to things collected marks are validated against — subject paper sets,
+    maximum marks, question sets, the exam level. Roster membership is *not* one
+    of these; see :func:`_require_not_archived`.
+    """
     if exam.phase != ExamPhase.REGISTRATION:
         raise HTTPException(
             409,
             f"Configuration is immutable in phase {exam.phase.value}; only allowed in REGISTRATION.",
+        )
+
+
+def _require_not_archived(exam: Exam) -> None:
+    """Gate for roster membership: enrolling a centre, registering a candidate.
+
+    These are corrected in the real world after entry opens — a late register, an
+    omitted candidate, a wrong name. Locking them to REGISTRATION would force
+    people to edit the database by hand, so the only closed state is ARCHIVED.
+    """
+    if exam.phase == ExamPhase.ARCHIVED:
+        raise HTTPException(
+            409, "This exam is archived and read-only. Reopen it before editing registrations."
         )
 
 
@@ -285,7 +303,7 @@ async def attach_school(
     db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin()),
 ):
     exam = await _get_exam(db, exam_id)
-    _require_registration_phase(exam)
+    _require_not_archived(exam)
     row = ExamSchool(exam_id=exam_id, school_id=payload.school_id)
     db.add(row)
     try:
@@ -312,7 +330,7 @@ async def bulk_enroll_schools(
     from ..models.registry import ExamLevel as _ExamLevel, School as _School
 
     exam = await _get_exam(db, exam_id)
-    _require_registration_phase(exam)
+    _require_not_archived(exam)
 
     if not payload.school_ids and not any(
         (payload.region_id, payload.council_id, payload.ward_id)
@@ -430,7 +448,7 @@ async def detach_school(
     """Un-enrol a school. Refused while it still has registered candidates, so
     marks can never be orphaned."""
     exam = await _get_exam(db, exam_id)
-    _require_registration_phase(exam)
+    _require_not_archived(exam)
 
     row = (
         await db.execute(
@@ -718,9 +736,17 @@ async def remove_student(
     exam_id: uuid.UUID, student_row_id: int,
     db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin()),
 ):
-    """De-register a candidate and their subject registrations."""
+    """De-register a candidate and their subject registrations.
+
+    Allowed at any live phase, because rosters get corrected after entry opens.
+    Refused once the candidate carries attendance or marks: deleting then would
+    orphan collected evidence. Clear the marks first, or raise an incident.
+    """
+    from ..models.marks import Attendance, ItemMark, TotalMark
+
     exam = await _get_exam(db, exam_id)
-    _require_registration_phase(exam)
+    if exam.phase == ExamPhase.ARCHIVED:
+        raise HTTPException(409, "This exam is archived and read-only.")
 
     student = (
         await db.execute(
@@ -732,9 +758,36 @@ async def remove_student(
     if student is None:
         raise HTTPException(404, "candidate not found in this exam")
 
-    await db.execute(
-        delete(ExamStudentSubject).where(ExamStudentSubject.exam_student_id == student.id)
-    )
+    ess_ids = (
+        await db.execute(
+            select(ExamStudentSubject.id).where(
+                ExamStudentSubject.exam_student_id == student.id
+            )
+        )
+    ).scalars().all()
+
+    if ess_ids:
+        for model, label in (
+            (Attendance, "attendance record"),
+            (TotalMark, "total mark"),
+            (ItemMark, "item mark"),
+        ):
+            count = await db.scalar(
+                select(func.count())
+                .select_from(model)
+                .where(model.exam_student_subject_id.in_(ess_ids))
+            )
+            if count:
+                raise HTTPException(
+                    409,
+                    f"Cannot de-register: this candidate has {count} {label}(s). "
+                    "Remove the collected data first.",
+                )
+
+        await db.execute(
+            delete(ExamStudentSubject).where(ExamStudentSubject.exam_student_id == student.id)
+        )
+
     await db.delete(student)
     await db.flush()
     return Response(status_code=204)
@@ -746,7 +799,7 @@ async def register_student(
     db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin()),
 ):
     exam = await _get_exam(db, exam_id)
-    _require_registration_phase(exam)
+    _require_not_archived(exam)
     student = ExamStudent(
         student_id=payload.student_id, exam_id=exam_id, school_id=payload.school_id,
         first_name=payload.first_name, middle_name=payload.middle_name,
