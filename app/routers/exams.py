@@ -12,8 +12,8 @@ import uuid
 
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import delete, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,11 +44,13 @@ from ..schemas_exam import (
     DataEntererScopeIn,
     ExamIn,
     ExamOut,
+    ExamPatch,
     ExamSchoolIn,
     ExamStudentIn,
     ExamStudentOut,
     ExamSubjectIn,
     ExamSubjectOut,
+    ExamSubjectPatch,
     PhaseTransitionIn,
     ReadinessOut,
     RoleAssignmentIn,
@@ -57,6 +59,8 @@ from ..schemas_exam import (
     WriterAssignmentIn,
     WriterAssignmentOut,
 )
+from ..schemas_registry import PaginatedResponse
+from ..services.collection_progress import collection_progress
 from ..services.exam_config import seal_configuration_version, validate_subject_scoring
 from ..services.exam_phase import (
     assert_transition_allowed,
@@ -185,9 +189,59 @@ async def transition_phase(
 # ---- filling progress ----
 
 @router.get("/{exam_id}/filling-progress")
-async def get_filling_progress(exam_id: uuid.UUID, _: User = Depends(current_user)):
-    """Stub: returns empty list until marks processing integration is live."""
-    return []
+async def get_filling_progress(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(current_user),
+):
+    """Per-scope collection progress.
+
+    Kept at this path for backward compatibility, but it now returns the real
+    progress payload instead of an empty list: expected vs entered counts,
+    attendance transcription, finalization state and the specific blockers per
+    (school, subject, paper) scope.
+    """
+    exam = await _get_exam(db, exam_id)
+    return await collection_progress(db, exam=exam)
+
+
+@router.patch("/{exam_id}", response_model=ExamOut)
+async def update_exam(
+    exam_id: uuid.UUID,
+    payload: ExamPatch,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+):
+    """Update exam metadata and collection settings.
+
+    Settings govern how marks are validated, so they are only mutable during
+    REGISTRATION — the same rule the rest of the configuration follows. `phase`
+    is deliberately not patchable: it moves only through
+    ``POST /exams/{id}/transitions``, which enforces its preconditions.
+    """
+    exam = await _get_exam(db, exam_id)
+    updates = payload.model_dump(exclude_unset=True)
+
+    settings_update = updates.pop("settings", None)
+    if settings_update is not None:
+        _require_registration_phase(exam)
+        # Merge rather than replace, so a partial patch cannot silently drop
+        # settings the client did not send.
+        exam.settings = {**(exam.settings or {}), **settings_update}
+
+    if updates:
+        # Renaming or re-dating an exam is safe at any phase; changing its level
+        # is not, because subjects and candidates are already bound to it.
+        if "level_id" in updates and updates["level_id"] != exam.level_id:
+            _require_registration_phase(exam)
+        for key, value in updates.items():
+            setattr(exam, key, value)
+
+    try:
+        await db.flush()
+    except IntegrityError:
+        raise HTTPException(409, "exam name already exists")
+    return ExamOut.model_validate(exam)
 
 
 # ---- schools ----
@@ -317,12 +371,130 @@ async def bulk_enroll_schools(
     }
 
 
+@router.get("/{exam_id}/schools/stats")
+async def exam_schools_stats(
+    exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), _: User = Depends(current_user)
+):
+    """Enrolment totals for the exam, broken down by region and school type.
+
+    Lets the enrolled-schools page show coverage without paging the whole list.
+    """
+    from ..models.registry import Region as _Region, School as _School
+
+    total = await db.scalar(
+        select(func.count()).select_from(ExamSchool).where(ExamSchool.exam_id == exam_id)
+    )
+    with_candidates = await db.scalar(
+        select(func.count(func.distinct(ExamStudent.school_id))).where(
+            ExamStudent.exam_id == exam_id
+        )
+    )
+    by_region = (
+        await db.execute(
+            select(_Region.name, func.count(ExamSchool.id))
+            .select_from(ExamSchool)
+            .join(_School, _School.id == ExamSchool.school_id)
+            .outerjoin(_Region, _Region.id == _School.region_id)
+            .where(ExamSchool.exam_id == exam_id)
+            .group_by(_Region.name)
+            .order_by(_Region.name)
+        )
+    ).all()
+    by_type = (
+        await db.execute(
+            select(_School.school_type, func.count(ExamSchool.id))
+            .select_from(ExamSchool)
+            .join(_School, _School.id == ExamSchool.school_id)
+            .where(ExamSchool.exam_id == exam_id)
+            .group_by(_School.school_type)
+        )
+    ).all()
+
+    return {
+        "total": total or 0,
+        "with_candidates": with_candidates or 0,
+        "without_candidates": (total or 0) - (with_candidates or 0),
+        "by_region": [{"region": r or "Unassigned", "count": c} for r, c in by_region],
+        "by_school_type": [
+            {"school_type": (t.value if hasattr(t, "value") else str(t)), "count": c}
+            for t, c in by_type
+        ],
+    }
+
+
+@router.delete("/{exam_id}/schools/{school_id}", status_code=204)
+async def detach_school(
+    exam_id: uuid.UUID, school_id: int,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin()),
+):
+    """Un-enrol a school. Refused while it still has registered candidates, so
+    marks can never be orphaned."""
+    exam = await _get_exam(db, exam_id)
+    _require_registration_phase(exam)
+
+    row = (
+        await db.execute(
+            select(ExamSchool).where(
+                ExamSchool.exam_id == exam_id, ExamSchool.school_id == school_id
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "school is not enrolled in this exam")
+
+    candidates = await db.scalar(
+        select(func.count()).select_from(ExamStudent).where(
+            ExamStudent.exam_id == exam_id, ExamStudent.school_id == school_id
+        )
+    )
+    if candidates:
+        raise HTTPException(
+            409,
+            f"Cannot un-enrol: {candidates} candidate(s) are registered at this school. "
+            "Remove them first.",
+        )
+
+    await db.delete(row)
+    await db.flush()
+    return Response(status_code=204)
+
+
 # ---- subjects ----
 
 @router.get("/{exam_id}/subjects", response_model=list[ExamSubjectOut])
 async def list_exam_subjects(exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), _: User = Depends(current_user)):
-    rows = (await db.execute(select(ExamSubject).where(ExamSubject.exam_id == exam_id))).scalars().all()
-    return [ExamSubjectOut.model_validate(r) for r in rows]
+    """Subjects offered in this exam, enriched with registry code/name and the
+    number of candidates registered for each."""
+    from ..models.registry import Subject as _Subject
+
+    counts = dict(
+        (
+            await db.execute(
+                select(ExamStudentSubject.exam_subject_id, func.count())
+                .join(ExamSubject, ExamSubject.id == ExamStudentSubject.exam_subject_id)
+                .where(ExamSubject.exam_id == exam_id)
+                .group_by(ExamStudentSubject.exam_subject_id)
+            )
+        ).all()
+    )
+
+    rows = (
+        await db.execute(
+            select(ExamSubject, _Subject.code, _Subject.name)
+            .join(_Subject, _Subject.id == ExamSubject.subject_id)
+            .where(ExamSubject.exam_id == exam_id)
+            .order_by(_Subject.code)
+        )
+    ).all()
+
+    out: list[ExamSubjectOut] = []
+    for exam_subject, code, name in rows:
+        item = ExamSubjectOut.model_validate(exam_subject)
+        item.subject_code = code
+        item.subject_name = name
+        item.candidate_count = counts.get(exam_subject.id, 0)
+        out.append(item)
+    return out
 
 
 @router.post("/{exam_id}/subjects", response_model=ExamSubjectOut, status_code=201)
@@ -341,12 +513,231 @@ async def attach_subject(
     return ExamSubjectOut.model_validate(row)
 
 
+@router.post("/{exam_id}/subjects/seed-defaults")
+async def seed_default_subjects(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin()),
+):
+    """Re-attach every registry subject that belongs to this exam's level.
+
+    Same mapping used at exam creation (SFNA/PSLE → primary, FTNA/CSEE → O-level,
+    ACSEE → A-level). Idempotent: subjects already offered are left untouched,
+    so their paper configuration is never overwritten.
+    """
+    from ..models.registry import ExamLevel as _ExamLevel, Subject as _Subject
+
+    exam = await _get_exam(db, exam_id)
+    _require_registration_phase(exam)
+
+    level = await db.get(_ExamLevel, exam.level_id)
+    level_name = (level.name or "").upper() if level else ""
+    flag = {
+        "SFNA": _Subject.is_primary, "PSLE": _Subject.is_primary,
+        "FTNA": _Subject.is_olevel, "CSEE": _Subject.is_olevel,
+        "ACSEE": _Subject.is_alevel,
+    }.get(level_name)
+    if flag is None:
+        raise HTTPException(422, f"No default subject set is defined for level {level_name!r}.")
+
+    existing = set(
+        (
+            await db.execute(
+                select(ExamSubject.subject_id).where(ExamSubject.exam_id == exam_id)
+            )
+        ).scalars().all()
+    )
+    candidates = (await db.execute(select(_Subject).where(flag.is_(True)))).scalars().all()
+
+    added = 0
+    for subject in candidates:
+        if subject.id in existing:
+            continue
+        db.add(
+            ExamSubject(
+                exam_id=exam_id,
+                subject_id=subject.id,
+                has_theory2=subject.has_theory2,
+                has_practical=subject.has_practical,
+                total_marks_theory1=100,
+                total_marks_theory2=100 if subject.has_theory2 else 0,
+                total_marks_practical=100 if subject.has_practical else 0,
+            )
+        )
+        added += 1
+    await db.flush()
+    return {"level": level_name, "added": added, "skipped": len(existing), "matched": len(candidates)}
+
+
+@router.patch("/{exam_id}/subjects/{exam_subject_id}", response_model=ExamSubjectOut)
+async def patch_exam_subject(
+    exam_id: uuid.UUID, exam_subject_id: int, payload: ExamSubjectPatch,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin()),
+):
+    """Update one subject's paper configuration (which papers exist and their
+    maximum marks). Locked outside REGISTRATION — these values define how marks
+    are validated."""
+    exam = await _get_exam(db, exam_id)
+    _require_registration_phase(exam)
+
+    row = (
+        await db.execute(
+            select(ExamSubject).where(
+                ExamSubject.id == exam_subject_id, ExamSubject.exam_id == exam_id
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "subject is not offered in this exam")
+
+    updates = payload.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        if value is not None:
+            setattr(row, key, value)
+
+    # Keep maxima coherent with which papers are enabled.
+    if not row.has_theory2:
+        row.total_marks_theory2 = 0
+    elif row.total_marks_theory2 == 0:
+        row.total_marks_theory2 = 100
+    if not row.has_practical:
+        row.total_marks_practical = 0
+    elif row.total_marks_practical == 0:
+        row.total_marks_practical = 100
+    if row.total_marks_theory1 <= 0:
+        raise HTTPException(422, "Theory 1 maximum marks must be greater than zero.")
+
+    await db.flush()
+    return ExamSubjectOut.model_validate(row)
+
+
+@router.delete("/{exam_id}/subjects/{exam_subject_id}", status_code=204)
+async def detach_subject(
+    exam_id: uuid.UUID, exam_subject_id: int,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin()),
+):
+    """Stop offering a subject. Refused once candidates are registered for it."""
+    exam = await _get_exam(db, exam_id)
+    _require_registration_phase(exam)
+
+    row = (
+        await db.execute(
+            select(ExamSubject).where(
+                ExamSubject.id == exam_subject_id, ExamSubject.exam_id == exam_id
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "subject is not offered in this exam")
+
+    registered = await db.scalar(
+        select(func.count()).select_from(ExamStudentSubject).where(
+            ExamStudentSubject.exam_subject_id == exam_subject_id
+        )
+    )
+    if registered:
+        raise HTTPException(
+            409,
+            f"Cannot remove: {registered} candidate(s) are registered for this subject.",
+        )
+
+    await db.delete(row)
+    await db.flush()
+    return Response(status_code=204)
+
+
 # ---- students ----
 
-@router.get("/{exam_id}/students", response_model=list[ExamStudentOut])
-async def list_students(exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), _: User = Depends(current_user)):
-    rows = (await db.execute(select(ExamStudent).where(ExamStudent.exam_id == exam_id).limit(500))).scalars().all()
-    return [ExamStudentOut.model_validate(r) for r in rows]
+@router.get("/{exam_id}/students", response_model=PaginatedResponse[ExamStudentOut])
+async def list_students(
+    exam_id: uuid.UUID,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    school_id: int | None = Query(None, description="Restrict to one enrolled school."),
+    search: str = Query("", max_length=160, description="Match candidate number or name."),
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(current_user),
+):
+    """Paginated candidate roster, enriched with centre/school and subject count.
+
+    Replaces the previous bare ``.limit(500)``, which silently truncated any
+    exam larger than 500 candidates.
+    """
+    from ..models.registry import School as _School
+
+    stmt = (
+        select(ExamStudent, _School.centre_number, _School.name)
+        .join(_School, _School.id == ExamStudent.school_id)
+        .where(ExamStudent.exam_id == exam_id)
+    )
+    if school_id is not None:
+        stmt = stmt.where(ExamStudent.school_id == school_id)
+    if search:
+        like = f"%{search}%"
+        stmt = stmt.where(
+            ExamStudent.student_id.ilike(like)
+            | ExamStudent.first_name.ilike(like)
+            | ExamStudent.middle_name.ilike(like)
+            | ExamStudent.surname.ilike(like)
+        )
+
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(_School.centre_number, ExamStudent.student_id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+
+    student_ids = [s.id for s, _c, _n in rows]
+    counts: dict[int, int] = {}
+    if student_ids:
+        counts = dict(
+            (
+                await db.execute(
+                    select(ExamStudentSubject.exam_student_id, func.count())
+                    .where(ExamStudentSubject.exam_student_id.in_(student_ids))
+                    .group_by(ExamStudentSubject.exam_student_id)
+                )
+            ).all()
+        )
+
+    items: list[ExamStudentOut] = []
+    for student, centre_number, school_name in rows:
+        item = ExamStudentOut.model_validate(student)
+        item.centre_number = centre_number
+        item.school_name = school_name
+        item.subject_count = counts.get(student.id, 0)
+        items.append(item)
+
+    return PaginatedResponse(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.delete("/{exam_id}/students/{student_row_id}", status_code=204)
+async def remove_student(
+    exam_id: uuid.UUID, student_row_id: int,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin()),
+):
+    """De-register a candidate and their subject registrations."""
+    exam = await _get_exam(db, exam_id)
+    _require_registration_phase(exam)
+
+    student = (
+        await db.execute(
+            select(ExamStudent).where(
+                ExamStudent.id == student_row_id, ExamStudent.exam_id == exam_id
+            )
+        )
+    ).scalar_one_or_none()
+    if student is None:
+        raise HTTPException(404, "candidate not found in this exam")
+
+    await db.execute(
+        delete(ExamStudentSubject).where(ExamStudentSubject.exam_student_id == student.id)
+    )
+    await db.delete(student)
+    await db.flush()
+    return Response(status_code=204)
 
 
 @router.post("/{exam_id}/students", response_model=ExamStudentOut, status_code=201)

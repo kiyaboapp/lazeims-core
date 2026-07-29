@@ -25,6 +25,7 @@ from .routers import exams as exams_router
 from .routers import integration as integration_router
 from .routers import marks as marks_router
 from .routers import notifications as notifications_router
+from .routers import registration as registration_router
 from .routers import routers_registry as registry_router
 from .routers import station_sync as station_sync_router
 from .routers import stations as stations_router
@@ -92,6 +93,9 @@ def create_app() -> FastAPI:
     app.include_router(auth_router.router, prefix=API_PREFIX)
     app.include_router(registry_router.router, prefix=API_PREFIX)
     app.include_router(exams_router.router, prefix=API_PREFIX)
+    # registration_router shares the /exams prefix; mounted after exams_router so
+    # its literal sub-paths are matched without shadowing exam CRUD.
+    app.include_router(registration_router.router, prefix=API_PREFIX)
     app.include_router(integration_router.router, prefix=API_PREFIX)
     app.include_router(marks_router.router, prefix=API_PREFIX)
     app.include_router(stations_router.router, prefix=API_PREFIX)

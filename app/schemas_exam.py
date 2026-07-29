@@ -50,6 +50,34 @@ class ExamOut(ORMModel):
     current_configuration_version: int | None
 
 
+class ExamSettingsPatch(BaseModel):
+    """Partial settings update. Every field optional so a caller can change one
+    setting without restating the rest."""
+
+    model_config = ConfigDict(extra="forbid")
+    has_theory2: bool | None = None
+    has_practical: bool | None = None
+    has_filling_station: bool | None = None
+    filling_mode: str | None = None   # TOTAL_MARKS | ITEM_LEVEL
+    display_mode: str | None = None   # NAME | ID_ONLY
+
+
+class ExamPatch(BaseModel):
+    """Partial exam update.
+
+    ``phase`` is intentionally absent: it moves only through the transitions
+    endpoint, which enforces the state machine and its preconditions.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    level_id: int | None = None
+    board_id: int | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    settings: ExamSettingsPatch | None = None
+
+
 class PhaseTransitionIn(BaseModel):
     target_phase: ExamPhase
     reason: str | None = None  # required for ENTRY_LOCKED -> ENTRY_OPEN reopen
@@ -85,6 +113,16 @@ class ExamSubjectIn(BaseModel):
     total_marks_practical: int = 0
 
 
+class ExamSubjectPatch(BaseModel):
+    """Partial update of one exam-subject's paper configuration."""
+
+    has_theory2: bool | None = None
+    has_practical: bool | None = None
+    total_marks_theory1: int | None = Field(default=None, ge=0, le=1000)
+    total_marks_theory2: int | None = Field(default=None, ge=0, le=1000)
+    total_marks_practical: int | None = Field(default=None, ge=0, le=1000)
+
+
 class ExamSubjectOut(ORMModel):
     id: int
     exam_id: uuid.UUID
@@ -94,6 +132,11 @@ class ExamSubjectOut(ORMModel):
     total_marks_theory1: int
     total_marks_theory2: int
     total_marks_practical: int
+    # Enriched inline so clients never bulk-load the subject registry just to
+    # label this list.
+    subject_code: str | None = None
+    subject_name: str | None = None
+    candidate_count: int | None = None
 
 
 class ExamStudentIn(BaseModel):
@@ -111,7 +154,13 @@ class ExamStudentOut(ORMModel):
     student_id: str
     school_id: int
     first_name: str
+    middle_name: str | None = None
     surname: str
+    sex: Sex | None = None
+    # Enriched inline for roster rendering.
+    centre_number: str | None = None
+    school_name: str | None = None
+    subject_count: int | None = None
 
 
 # ---- scoring config ----
