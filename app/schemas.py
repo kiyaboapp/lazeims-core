@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import uuid
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from lazeims_common.enums import SchoolType, Sex
@@ -102,6 +105,96 @@ class SchoolOut(ORMModel):
     can_download_template: bool
 
 
+class SchoolExamSummary(BaseModel):
+    id: uuid.UUID
+    name: str
+    phase: str
+    start_date: str | None = None
+    end_date: str | None = None
+    student_count: int
+
+
+class RegionProfileOut(BaseModel):
+    id: int
+    name: str
+    created_at: datetime
+    updated_at: datetime
+    council_count: int
+    ward_count: int
+    school_count: int
+    government_school_count: int
+    private_school_count: int
+    unknown_school_count: int
+    scoped_user_count: int
+    station_count: int
+    exam_participation_count: int
+    student_count: int
+    councils: list[CouncilOut]
+    wards: list[WardOut]
+    schools: list[SchoolOut]
+
+
+class CouncilProfileOut(BaseModel):
+    id: int
+    name: str
+    region_id: int
+    region_name: str
+    created_at: datetime
+    updated_at: datetime
+    ward_count: int
+    school_count: int
+    government_school_count: int
+    private_school_count: int
+    unknown_school_count: int
+    scoped_user_count: int
+    station_count: int
+    exam_participation_count: int
+    student_count: int
+    wards: list[WardOut]
+    schools: list[SchoolOut]
+
+
+class WardProfileOut(BaseModel):
+    id: int
+    name: str
+    council_id: int
+    council_name: str
+    region_id: int
+    region_name: str
+    created_at: datetime
+    updated_at: datetime
+    school_count: int
+    government_school_count: int
+    private_school_count: int
+    unknown_school_count: int
+    exam_participation_count: int
+    student_count: int
+    schools: list[SchoolOut]
+
+
+class SchoolProfileOut(BaseModel):
+    id: int
+    centre_number: str
+    name: str
+    school_type: SchoolType
+    region_id: int | None
+    region_name: str | None
+    council_id: int | None
+    council_name: str | None
+    ward_id: int | None
+    ward_name: str | None
+    can_download_template: bool
+    created_at: datetime
+    updated_at: datetime
+    scoped_user_count: int
+    exam_count: int
+    student_count: int
+    data_enterer_scope_count: int
+    write_assignment_count: int
+    station_count: int
+    exams: list[SchoolExamSummary]
+
+
 # ---- registry: subjects ----
 
 class SubjectIn(BaseModel):
@@ -112,6 +205,16 @@ class SubjectIn(BaseModel):
     is_primary: bool = False
     has_theory2: bool = False
     has_practical: bool = False
+
+
+class SubjectPatch(BaseModel):
+    code: str | None = Field(default=None, min_length=1, max_length=20)
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    is_olevel: bool | None = None
+    is_alevel: bool | None = None
+    is_primary: bool | None = None
+    has_theory2: bool | None = None
+    has_practical: bool | None = None
 
 
 class SubjectOut(ORMModel):

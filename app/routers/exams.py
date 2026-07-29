@@ -181,6 +181,14 @@ async def transition_phase(
     return ExamOut.model_validate(exam)
 
 
+# ---- filling progress ----
+
+@router.get("/{exam_id}/filling-progress")
+async def get_filling_progress(exam_id: uuid.UUID, _: User = Depends(current_user)):
+    """Stub: returns empty list until marks processing integration is live."""
+    return []
+
+
 # ---- schools ----
 
 @router.get("/{exam_id}/schools")

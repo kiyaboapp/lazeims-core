@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 
 # Point the app at the test DB BEFORE any app import triggers settings caching.
-os.environ["DATABASE_URL"] = "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/lazeims_test"
+os.environ["DATABASE_URL"] = "postgresql+asyncpg://postgres:ma0zYn9RzAZbhBOE2Bs235KSwPdTeF4D@127.0.0.1:5432/lazeims_test"
 os.environ.setdefault("SESSION_SECRET_KEY", "test-secret-key-0123456789")
 os.environ.setdefault("STATION_PACKAGE_INTEGRITY_KEY", "test-integrity-key-0123456789")
 os.environ.setdefault("APP_ENV", "development")

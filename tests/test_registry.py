@@ -89,7 +89,175 @@ async def test_create_user_and_login(client):
 
 async def test_password_hash_never_returned(client):
     csrf = await login(client, "superadmin", "adminpass123")
-    r = await client.get("/api/v1/registry/users", headers={"X-CSRF-Token": csrf})
+    r = await client.get("/api/v1/registry/users")
     assert r.status_code == 200
-    for u in r.json():
+    for u in r.json()["items"]:
         assert "password_hash" not in u and "password" not in u
+
+
+# ---- Pagination & search tests ----
+
+
+async def test_list_regions_paginated(client):
+    csrf = await login(client, "superadmin", "adminpass123")
+    # Create several regions
+    for name in ("Arusha", "Mwanza", "Dodoma", "Dar es Salaam"):
+        await _mk(client, "regions", {"name": name}, csrf)
+
+    # Default page
+    r = await client.get("/api/v1/registry/regions")
+    assert r.status_code == 200
+    data = r.json()
+    assert "items" in data
+    assert "total" in data
+    assert "page" in data and data["page"] == 1
+    assert "page_size" in data
+    # The fixture seeds 2 regions + we added 4 = 6 total (at minimum)
+    assert data["total"] >= 4
+
+    # Search
+    r2 = await client.get("/api/v1/registry/regions?search=Dar")
+    assert r2.status_code == 200
+    assert all("Dar" in item["name"] for item in r2.json()["items"])
+
+    # Pagination
+    r3 = await client.get("/api/v1/registry/regions?page=1&page_size=2")
+    assert r3.status_code == 200
+    assert len(r3.json()["items"]) <= 2
+
+
+async def test_list_councils_filtered_by_region(client):
+    csrf = await login(client, "superadmin", "adminpass123")
+    reg = (await _mk(client, "regions", {"name": "FilterReg"}, csrf)).json()["id"]
+    await _mk(client, "councils", {"name": "FilterCouncil1", "region_id": reg}, csrf)
+    await _mk(client, "councils", {"name": "FilterCouncil2", "region_id": reg}, csrf)
+
+    r = await client.get(f"/api/v1/registry/councils?region_id={reg}")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert len(items) == 2
+    assert all(c["region_id"] == reg for c in items)
+
+
+async def test_list_schools_filtered_and_searched(client):
+    csrf = await login(client, "superadmin", "adminpass123")
+    reg = (await _mk(client, "regions", {"name": "SchReg"}, csrf)).json()["id"]
+    council = (await _mk(client, "councils", {"name": "SchCouncil", "region_id": reg}, csrf)).json()["id"]
+    await _mk(client, "schools", {
+        "centre_number": "SC001", "name": "Alpha School",
+        "region_id": reg, "council_id": council,
+    }, csrf)
+    await _mk(client, "schools", {
+        "centre_number": "SC002", "name": "Beta School",
+        "region_id": reg, "council_id": council,
+    }, csrf)
+
+    # Filter by region
+    r = await client.get(f"/api/v1/registry/schools?region_id={reg}")
+    assert r.status_code == 200
+    assert r.json()["total"] >= 2
+
+    # Search by centre_number
+    r2 = await client.get("/api/v1/registry/schools?search=SC001")
+    assert r2.status_code == 200
+    assert any(s["centre_number"] == "SC001" for s in r2.json()["items"])
+
+    # Search by name
+    r3 = await client.get("/api/v1/registry/schools?search=Alpha")
+    assert r3.status_code == 200
+    assert any("Alpha" in s["name"] for s in r3.json()["items"])
+
+
+# ---- Detail endpoint tests ----
+
+
+async def test_region_detail(client):
+    csrf = await login(client, "superadmin", "adminpass123")
+    region = (await _mk(client, "regions", {"name": "Detail Region"}, csrf)).json()
+    council = (await _mk(client, "councils", {"name": "Detail Council", "region_id": region["id"]}, csrf)).json()
+    ward = (await _mk(client, "wards", {"name": "Detail Ward", "council_id": council["id"]}, csrf)).json()
+    await _mk(client, "schools", {
+        "centre_number": "DT001", "name": "Detail School",
+        "region_id": region["id"], "council_id": council["id"], "ward_id": ward["id"],
+    }, csrf)
+
+    r = await client.get(f"/api/v1/registry/regions/{region['id']}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["name"] == "Detail Region"
+    assert data["council_count"] == 1
+    assert data["ward_count"] == 1
+    assert data["school_count"] == 1
+    assert data["student_count"] == 0  # no exam students
+    assert data["user_count"] >= 0
+
+
+async def test_council_detail(client):
+    csrf = await login(client, "superadmin", "adminpass123")
+    region = (await _mk(client, "regions", {"name": "CDet Region"}, csrf)).json()
+    council = (await _mk(client, "councils", {"name": "CDet Council", "region_id": region["id"]}, csrf)).json()
+    ward = (await _mk(client, "wards", {"name": "CDet Ward", "council_id": council["id"]}, csrf)).json()
+    await _mk(client, "schools", {
+        "centre_number": "CD001", "name": "CDet School",
+        "region_id": region["id"], "council_id": council["id"], "ward_id": ward["id"],
+    }, csrf)
+
+    r = await client.get(f"/api/v1/registry/councils/{council['id']}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["name"] == "CDet Council"
+    assert data["region_name"] == "CDet Region"
+    assert data["ward_count"] == 1
+    assert data["school_count"] == 1
+
+
+async def test_ward_detail(client):
+    csrf = await login(client, "superadmin", "adminpass123")
+    region = (await _mk(client, "regions", {"name": "WDet Region"}, csrf)).json()
+    council = (await _mk(client, "councils", {"name": "WDet Council", "region_id": region["id"]}, csrf)).json()
+    ward = (await _mk(client, "wards", {"name": "WDet Ward", "council_id": council["id"]}, csrf)).json()
+    await _mk(client, "schools", {
+        "centre_number": "WD001", "name": "WDet School",
+        "council_id": council["id"], "ward_id": ward["id"],
+    }, csrf)
+
+    r = await client.get(f"/api/v1/registry/wards/{ward['id']}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["name"] == "WDet Ward"
+    assert data["council_name"] == "WDet Council"
+    assert data["region_name"] == "WDet Region"
+    assert data["school_count"] == 1
+
+
+async def test_school_detail(client):
+    csrf = await login(client, "superadmin", "adminpass123")
+    region = (await _mk(client, "regions", {"name": "SDet Region"}, csrf)).json()
+    council = (await _mk(client, "councils", {"name": "SDet Council", "region_id": region["id"]}, csrf)).json()
+    ward = (await _mk(client, "wards", {"name": "SDet Ward", "council_id": council["id"]}, csrf)).json()
+    school = (await _mk(client, "schools", {
+        "centre_number": "SD001", "name": "SDet School", "school_type": "GOVERNMENT",
+        "region_id": region["id"], "council_id": council["id"], "ward_id": ward["id"],
+        "can_download_template": True,
+    }, csrf)).json()
+
+    r = await client.get(f"/api/v1/registry/schools/{school['id']}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["name"] == "SDet School"
+    assert data["centre_number"] == "SD001"
+    assert data["school_type"] == "GOVERNMENT"
+    assert data["region_name"] == "SDet Region"
+    assert data["council_name"] == "SDet Council"
+    assert data["ward_name"] == "SDet Ward"
+    assert data["can_download_template"] is True
+    assert data["student_count"] == 0
+    assert data["exam_count"] == 0
+    assert data["user_count"] == 0
+
+
+async def test_detail_endpoints_return_404(client):
+    await login(client, "superadmin", "adminpass123")
+    for resource in ("regions", "councils", "wards", "schools"):
+        response = await client.get(f"/api/v1/registry/{resource}/999999")
+        assert response.status_code == 404
