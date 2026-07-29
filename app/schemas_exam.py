@@ -85,6 +85,16 @@ class ExamSubjectIn(BaseModel):
     total_marks_practical: int = 0
 
 
+class ExamSubjectPatch(BaseModel):
+    """Partial update of one exam-subject's paper configuration."""
+
+    has_theory2: bool | None = None
+    has_practical: bool | None = None
+    total_marks_theory1: int | None = Field(default=None, ge=0, le=1000)
+    total_marks_theory2: int | None = Field(default=None, ge=0, le=1000)
+    total_marks_practical: int | None = Field(default=None, ge=0, le=1000)
+
+
 class ExamSubjectOut(ORMModel):
     id: int
     exam_id: uuid.UUID
@@ -94,6 +104,11 @@ class ExamSubjectOut(ORMModel):
     total_marks_theory1: int
     total_marks_theory2: int
     total_marks_practical: int
+    # Enriched inline so clients never bulk-load the subject registry just to
+    # label this list.
+    subject_code: str | None = None
+    subject_name: str | None = None
+    candidate_count: int | None = None
 
 
 class ExamStudentIn(BaseModel):
@@ -111,7 +126,13 @@ class ExamStudentOut(ORMModel):
     student_id: str
     school_id: int
     first_name: str
+    middle_name: str | None = None
     surname: str
+    sex: Sex | None = None
+    # Enriched inline for roster rendering.
+    centre_number: str | None = None
+    school_name: str | None = None
+    subject_count: int | None = None
 
 
 # ---- scoring config ----
