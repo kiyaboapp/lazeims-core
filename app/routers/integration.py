@@ -340,8 +340,28 @@ async def extract_registrations(
 ):
     """Extract student registrations from an uploaded PDF/ZIP via ExaMetrics.
     Nothing is stored in ExaMetrics; the parsed rows are returned so Central can
-    register the students itself."""
-    link = await _require_link(db, exam_id)
+    register the students itself.
+
+    Unlike processing endpoints, extraction does not require backend_exam_id
+    because the call is free and stateless (no exam path on the ExaMetrics side).
+    """
+    link = await _get_link(db, exam_id)
+    if link is None:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PROCESSING_NOT_CONFIGURED",
+                "message": "Configure an API key for this exam before using extraction.",
+            },
+        )
+    if not get_settings().processing_enabled:
+        raise HTTPException(
+            503,
+            detail={
+                "code": "PROCESSING_DISABLED",
+                "message": "This deployment has no ExaMetrics base URL configured.",
+            },
+        )
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")

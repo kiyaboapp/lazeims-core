@@ -29,7 +29,7 @@ def upgrade() -> None:
         existing_type=sa.String(length=36),
         nullable=True,
     )
-    # Cache the full capabilities response from GET /integration/me.
+    # Cache the capabilities sub-map from GET /integration/me.
     op.add_column(
         "exam_processing_links",
         sa.Column("capabilities_json", JSONB, nullable=True),
