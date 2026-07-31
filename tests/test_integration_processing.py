@@ -71,7 +71,7 @@ async def test_link_accepts_key_only(client, monkeypatch):
         assert body["configured"] is True
         assert body["backend_exam_id"] is None
         assert body["tenant_name"] == "Test Board"
-        assert body["capabilities"] == FAKE_IDENTITY_RESPONSE
+        assert body["capabilities"] == FAKE_IDENTITY_RESPONSE["capabilities"]
         assert body["capabilities_fetched_at"] is not None
         mock_identity.assert_called_once_with("valid-test-key-12345678")
     finally:
@@ -156,7 +156,7 @@ async def test_capabilities_endpoint(client, monkeypatch):
         resp = await client.get(f"/api/v1/exams/{exam_id}/processing/capabilities", headers=h)
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["capabilities"] == FAKE_IDENTITY_RESPONSE
+        assert body["capabilities"] == FAKE_IDENTITY_RESPONSE["capabilities"]
         assert body["tenant_name"] == "Test Board"
         assert body["fetched_at"] is not None
     finally:

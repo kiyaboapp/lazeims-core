@@ -71,7 +71,15 @@ async def _require_link(db: AsyncSession, exam_id: uuid.UUID) -> ExamProcessingL
             409,
             detail={
                 "code": "PROCESSING_NOT_CONFIGURED",
-                "message": "Add the ExaMetrics exam id and API key before using processing.",
+                "message": "Configure an API key for this exam before using processing.",
+            },
+        )
+    if link.backend_exam_id is None:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EXAM_NOT_PROVISIONED",
+                "message": "Exam provisioning has not completed yet.",
             },
         )
     if not get_settings().processing_enabled:
@@ -143,9 +151,9 @@ async def set_processing_link(
         link.api_key = api_key
         link.configured_by = user.id
 
-    # Cache capabilities from the identity response.
+    # Cache only the capabilities sub-map from the identity response.
     if identity_data is not None:
-        link.capabilities_json = identity_data
+        link.capabilities_json = identity_data.get("capabilities")
         link.capabilities_fetched_at = datetime.now(timezone.utc)
         tenant = identity_data.get("tenant")
         if isinstance(tenant, dict):
