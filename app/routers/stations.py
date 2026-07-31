@@ -102,6 +102,43 @@ async def list_stations(exam_id: uuid.UUID, db: AsyncSession = Depends(get_sessi
     return [StationOut.model_validate(s) for s in rows]
 
 
+@router.get("/{exam_id}/stations/credential-candidates")
+async def credential_candidates(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_station_manager),
+):
+    """List exam assignments eligible for a station login.
+
+    Station managers need this narrow view to issue credentials; the full exam
+    team endpoint remains restricted to exam administrators.
+    """
+    await _get_exam(db, exam_id)
+    rows = (
+        await db.execute(
+            select(ExamRoleAssignment, User)
+            .join(User, User.id == ExamRoleAssignment.user_id)
+            .where(
+                ExamRoleAssignment.exam_id == exam_id,
+                ExamRoleAssignment.role.in_(
+                    [ExamRoleName.DATA_ENTERER, ExamRoleName.EXAM_ADMIN]
+                ),
+            )
+            .order_by(ExamRoleAssignment.role, User.surname, User.first_name)
+        )
+    ).all()
+    return [
+        {
+            "assignment_id": assignment.id,
+            "user_id": assignment.user_id,
+            "role": assignment.role.value,
+            "name": f"{candidate.first_name} {candidate.surname}".strip(),
+            "username": candidate.username,
+        }
+        for assignment, candidate in rows
+    ]
+
+
 @router.post("/{exam_id}/stations/{station_id}/credentials", response_model=CredentialOut, status_code=201)
 async def issue_credential(
     exam_id: uuid.UUID, station_id: int, payload: CredentialIn,

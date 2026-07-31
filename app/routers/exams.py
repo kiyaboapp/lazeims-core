@@ -22,7 +22,7 @@ from lazeims_common.errors import ValidationError
 
 from ..db import get_session
 from ..deps import current_user, require_role
-from ..deps_exam import require_exam_admin
+from ..deps_exam import get_exam_roles, require_exam_admin
 from ..enums import ExamRoleName, StandingRoleName
 from ..models.assignments import (
     DataEntererScope,
@@ -184,6 +184,50 @@ async def transition_phase(
     exam.phase = payload.target_phase
     await db.flush()
     return ExamOut.model_validate(exam)
+
+
+# ---- current-user exam access ----
+
+@router.get("/{exam_id}/access")
+async def get_my_exam_access(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    """Return server-resolved capabilities for navigation and action discovery.
+
+    This is advisory UI metadata only; every domain endpoint still enforces its
+    own authorization. Exam roles always come from ExamRoleAssignment.
+    """
+    await _get_exam(db, exam_id)
+    exam_roles = await get_exam_roles(db, exam_id, user)
+    standing_role = user.role.name.value
+    is_global_admin = standing_role in {
+        StandingRoleName.SUPER_ADMIN.value,
+        StandingRoleName.SYSTEM_ADMIN.value,
+    }
+    is_chief_it = standing_role in {
+        StandingRoleName.REGION_ITS.value,
+        StandingRoleName.COUNCIL_ITS.value,
+    }
+    is_exam_admin = ExamRoleName.EXAM_ADMIN.value in exam_roles
+    is_data_enterer = ExamRoleName.DATA_ENTERER.value in exam_roles
+
+    return {
+        "standing_role": standing_role,
+        "exam_roles": sorted(exam_roles),
+        "capabilities": {
+            "manage_exam": is_global_admin or is_exam_admin,
+            "enter_data": is_global_admin or is_exam_admin or is_data_enterer,
+            "oversee_attendance": is_global_admin or is_chief_it,
+            "manage_stations": is_global_admin or is_exam_admin or is_chief_it,
+            "view_incidents": (
+                is_global_admin or is_exam_admin or is_data_enterer or is_chief_it
+            ),
+            "view_progress": True,
+            "view_results": True,
+        },
+    }
 
 
 # ---- filling progress ----

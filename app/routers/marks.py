@@ -29,8 +29,8 @@ from lazeims_common.errors import ValidationError
 from lazeims_common.hashing import sha256_prefixed
 
 from ..db import get_session
-from ..deps import require_role
-from ..deps_exam import require_exam_role
+from ..deps import current_user, require_role
+from ..deps_exam import get_exam_roles, require_exam_role
 from ..enums import ExamRoleName, StandingRoleName
 from ..models.assignments import FinalizedScope, ScopeRevision
 from ..models.exam import Exam, ExamStudent, ExamStudentSubject, ExamSubject
@@ -66,6 +66,25 @@ _CHIEF_IT = require_role(
     StandingRoleName.REGION_ITS, StandingRoleName.COUNCIL_ITS,
     StandingRoleName.SUPER_ADMIN, StandingRoleName.SYSTEM_ADMIN,
 )
+
+
+async def _incident_viewer(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(current_user),
+) -> User:
+    standing_role = user.role.name.value
+    if standing_role in {
+        StandingRoleName.REGION_ITS.value,
+        StandingRoleName.COUNCIL_ITS.value,
+        StandingRoleName.SUPER_ADMIN.value,
+        StandingRoleName.SYSTEM_ADMIN.value,
+    }:
+        return user
+    roles = await get_exam_roles(db, exam_id, user)
+    if roles & {ExamRoleName.DATA_ENTERER.value, ExamRoleName.EXAM_ADMIN.value}:
+        return user
+    raise HTTPException(403, "Not permitted to view incidents for this exam")
 
 
 def _vhttp(exc: ValidationError) -> HTTPException:
@@ -182,7 +201,7 @@ async def create_incident(
 
 
 @router.get("/{exam_id}/incidents", response_model=list[IncidentOut])
-async def list_incidents(exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), user: User = Depends(_ENTRY_ACTOR)):
+async def list_incidents(exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), user: User = Depends(_incident_viewer)):
     rows = (await db.execute(select(ExamIncident).where(ExamIncident.exam_id == exam_id))).scalars().all()
     return [IncidentOut.model_validate(r) for r in rows]
 
