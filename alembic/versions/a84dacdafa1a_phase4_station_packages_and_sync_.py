@@ -9,6 +9,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 revision: str = 'a84dacdafa1a'
 down_revision: Union[str, None] = '7738c7d5c366'
@@ -21,7 +22,7 @@ def upgrade() -> None:
     op.create_table('station_packages',
     sa.Column('package_id', sa.String(length=80), nullable=False),
     sa.Column('station_id', sa.Integer(), nullable=False),
-    sa.Column('exam_id', sa.Integer(), nullable=False),
+    sa.Column('exam_id', PG_UUID(as_uuid=True), nullable=False),
     sa.Column('package_version', sa.Integer(), nullable=False),
     sa.Column('rules_version', sa.String(length=20), nullable=False),
     sa.Column('software_min_version', sa.String(length=20), nullable=False),

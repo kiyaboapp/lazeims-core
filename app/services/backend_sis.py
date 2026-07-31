@@ -71,6 +71,18 @@ async def extract_registrations(api_key: str, filename: str, content: bytes, con
         return _unwrap(resp)
 
 
+async def identity(api_key: str) -> dict:
+    """Validate a key and fetch tenant/capabilities via GET /integration/me.
+
+    Unlike other methods, this endpoint has no exam_id in the path. It returns
+    the tenant info, capabilities map, and contract version for the given key.
+    Raises BackendSisError on any non-2xx response.
+    """
+    async with _client(api_key) as client:
+        resp = await client.get("/integration/me")
+        return _unwrap(resp)
+
+
 async def push_collection(api_key: str, backend_exam_id: str, payload: dict) -> Any:
     async with _client(api_key) as client:
         resp = await client.post(f"/integration/exams/{backend_exam_id}/collection", json=payload)

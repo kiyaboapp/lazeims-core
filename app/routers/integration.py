@@ -3,13 +3,14 @@
 LAZEIMS collects; ExaMetrics processes. An EXAM_ADMIN records the per-exam
 ExaMetrics link (backend exam id + purchased API key), submits the collected
 data for processing, polls status, publishes results, and downloads processed
-outputs — all proxied through Central so the browser never holds the API key.
+outputs -- all proxied through Central so the browser never holds the API key.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from pydantic import BaseModel, Field
@@ -36,7 +37,7 @@ router = APIRouter(prefix="/exams", tags=["processing"])
 
 
 class ProcessingLinkIn(BaseModel):
-    backend_exam_id: str = Field(..., min_length=1, max_length=36)
+    backend_exam_id: str | None = Field(None, max_length=36)
     api_key: str = Field(..., min_length=8, max_length=120)
 
 
@@ -45,6 +46,9 @@ class ProcessingLinkOut(BaseModel):
     backend_exam_id: str | None = None
     last_submitted_at: datetime | None = None
     last_status: str | None = None
+    tenant_name: str | None = None
+    capabilities: dict | None = None
+    capabilities_fetched_at: datetime | None = None
 
 
 async def _get_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
@@ -67,7 +71,15 @@ async def _require_link(db: AsyncSession, exam_id: uuid.UUID) -> ExamProcessingL
             409,
             detail={
                 "code": "PROCESSING_NOT_CONFIGURED",
-                "message": "Add the ExaMetrics exam id and API key before using processing.",
+                "message": "Configure an API key for this exam before using processing.",
+            },
+        )
+    if link.backend_exam_id is None:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EXAM_NOT_PROVISIONED",
+                "message": "Exam provisioning has not completed yet.",
             },
         )
     if not get_settings().processing_enabled:
@@ -101,6 +113,9 @@ async def get_processing_link(
         backend_exam_id=link.backend_exam_id,
         last_submitted_at=link.last_submitted_at,
         last_status=link.last_status,
+        tenant_name=link.tenant_name,
+        capabilities=link.capabilities_json,
+        capabilities_fetched_at=link.capabilities_fetched_at,
     )
 
 
@@ -112,22 +127,62 @@ async def set_processing_link(
     user: User = Depends(require_exam_admin()),
 ):
     await _get_exam(db, exam_id)
+
+    # Validate the API key against ExaMetrics before persisting.
+    api_key = payload.api_key.strip()
+    identity_data: dict[str, Any] | None = None
+    if get_settings().processing_enabled:
+        try:
+            identity_data = await backend_sis.identity(api_key)
+        except BackendSisError as exc:
+            raise _sis_http(exc)
+
     link = await _get_link(db, exam_id)
+    backend_exam_id = payload.backend_exam_id.strip() if payload.backend_exam_id else None
+
     if link is None:
         link = ExamProcessingLink(
-            exam_id=exam_id, backend_exam_id=payload.backend_exam_id.strip(),
-            api_key=payload.api_key.strip(), configured_by=user.id,
+            exam_id=exam_id, backend_exam_id=backend_exam_id,
+            api_key=api_key, configured_by=user.id,
         )
         db.add(link)
     else:
-        link.backend_exam_id = payload.backend_exam_id.strip()
-        link.api_key = payload.api_key.strip()
+        link.backend_exam_id = backend_exam_id
+        link.api_key = api_key
         link.configured_by = user.id
+
+    # Cache only the capabilities sub-map from the identity response.
+    if identity_data is not None:
+        link.capabilities_json = identity_data.get("capabilities")
+        link.capabilities_fetched_at = datetime.now(timezone.utc)
+        tenant = identity_data.get("tenant")
+        if isinstance(tenant, dict):
+            link.tenant_name = tenant.get("name")
+
     await db.flush()
     return ProcessingLinkOut(
         configured=True, backend_exam_id=link.backend_exam_id,
         last_submitted_at=link.last_submitted_at, last_status=link.last_status,
+        tenant_name=link.tenant_name,
+        capabilities=link.capabilities_json,
+        capabilities_fetched_at=link.capabilities_fetched_at,
     )
+
+
+# ── Capabilities ─────────────────────────────────────────────────────────────
+@router.get("/{exam_id}/processing/capabilities")
+async def get_capabilities(
+    exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), _: User = Depends(current_user)
+):
+    """Return cached capabilities for this exam's processing link."""
+    link = await _get_link(db, exam_id)
+    if link is None or link.capabilities_json is None:
+        raise HTTPException(404, detail="No capabilities available for this exam.")
+    return {
+        "capabilities": link.capabilities_json,
+        "tenant_name": link.tenant_name,
+        "fetched_at": link.capabilities_fetched_at,
+    }
 
 
 # ── Submit for processing ────────────────────────────────────────────────────
@@ -285,8 +340,28 @@ async def extract_registrations(
 ):
     """Extract student registrations from an uploaded PDF/ZIP via ExaMetrics.
     Nothing is stored in ExaMetrics; the parsed rows are returned so Central can
-    register the students itself."""
-    link = await _require_link(db, exam_id)
+    register the students itself.
+
+    Unlike processing endpoints, extraction does not require backend_exam_id
+    because the call is free and stateless (no exam path on the ExaMetrics side).
+    """
+    link = await _get_link(db, exam_id)
+    if link is None:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PROCESSING_NOT_CONFIGURED",
+                "message": "Configure an API key for this exam before using extraction.",
+            },
+        )
+    if not get_settings().processing_enabled:
+        raise HTTPException(
+            503,
+            detail={
+                "code": "PROCESSING_DISABLED",
+                "message": "This deployment has no ExaMetrics base URL configured.",
+            },
+        )
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
