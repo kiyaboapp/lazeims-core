@@ -663,3 +663,55 @@ These are the differences between "integrated" and "pleasant":
 | Result stats | `GET /integration/exams/{id}/results/stats` | scope `results.read` | **paid** |
 | Centre PDF | `GET /integration/exams/{id}/results/school/{centre}.pdf` | scope `results.download` | **paid** |
 | Raw XLSX | `GET /integration/exams/{id}/results/rawdata.xlsx` | scope `results.download` | **paid** |
+
+---
+
+## 16. Amendment — Phase 1.5: zero-touch key issuance `[IMPLEMENTED]`
+
+No human handles an API key any more, which pulls **B13 (partner self-provisioning)**
+forward out of Phase 3. It is implemented by *calling* the existing
+`POST /integration/provision` + `X-Provision-Secret` path rather than adding a
+second issuance surface, and by closing its three gaps: no requester identity,
+`board_id` mandatory on first provision, and `exams.start_date`/`end_date` being
+`NOT NULL` while Central's are nullable.
+
+* **On exam creation**, Central posts the exam details plus the creator — resolved
+  from the session, never from the browser, so it cannot be forged — and stores
+  the key it receives on `ExamProcessingLink`. Failure is audited and swallowed:
+  an exam is still created when ExaMetrics is unreachable.
+* **For exams that predate this**, `POST /exams/{id}/processing/access-key`
+  (`?rotate=true` to re-issue) does the same on demand, and `submit` heals a
+  `PROVISIONED` link whose `backend_exam_id` is null.
+* **All scopes are requested every time.** Free (`collection:push`) comes back
+  usable; the paid three come back `PENDING` for the existing approval queue, so
+  §9.4 still holds — nothing paid is granted silently.
+* **The secret never surfaces.** No response body contains `api_key` and no audit
+  record contains it; `key_prefix` is the only key-derived value shown (§13.1).
+  `key_source` records `PROVISIONED` vs `MANUAL` so re-provisioning never
+  overwrites a hand-entered key. `PUT /processing/link` survives as the
+  support-only escape hatch (§13.10).
+* **Requester identity** is stored in a new `exam_api_keys.requested_by` JSONB
+  column — `created_by` is an FK to an *ExaMetrics* user and can never describe a
+  partner's operator — and is shown on `GET /integration/keys/pending`.
+* **Naming:** the exam an integration key is scoped to is `tenant_exam`
+  (`TenantExamInfo`, `tenant_exam_name`, "ExaMetrics exam account" in UI copy).
+  Bare `tenant` is not used for this concept again, because backend-sis already
+  spends the word on a subscribing school (`TenantSchool`,
+  `shuleyetu_tenant_schools`). `GET /integration/me` emits both keys for one
+  release since the two services deploy independently; the legacy `tenant` key
+  and the deprecated `TenantInfo` alias are dropped in Phase 5.
+* **Board and dates are resolved by ExaMetrics** (new optional `board_name`):
+  match a board by case-insensitive name, else create it, else fall back to
+  `INTEGRATION_PROVISION_DEFAULT_BOARD_ID`, else `BOARD_REQUIRED`. Missing dates
+  default to today / today+1.
+
+Answers assumed for §14, pending the backend-sis owner: keys are issued
+automatically to the partner *server* holding the zone enrolment secret, with paid
+scopes queued for a SUPER_ADMIN (14.3); `external_ref` is the Central exam UUID so
+its uniqueness is free and provisioning is idempotent on it (14.1); extraction is
+permanently free and needs no key (14.10). **Deviation from §9.5:** provisioning
+revokes the key it replaces in the same transaction, so exactly one key is ever
+active — overlapping keys during rotation stay a Phase 4 item.
+
+Still deferred: the quote/approval gate in Central (§6, C6/C7), `api_key`
+encryption at rest (C8), webhooks and chunked upload.

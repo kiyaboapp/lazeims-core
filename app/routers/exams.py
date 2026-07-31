@@ -60,8 +60,10 @@ from ..schemas_exam import (
     WriterAssignmentOut,
 )
 from ..schemas_registry import PaginatedResponse
+from ..services import notifications
 from ..services.collection_progress import collection_progress
 from ..services.exam_config import seal_configuration_version, validate_subject_scoring
+from ..services.exametrics_provision import ensure_access_key
 from ..services.exam_phase import (
     assert_transition_allowed,
     compute_entry_open_readiness,
@@ -100,8 +102,20 @@ async def list_exams(db: AsyncSession = Depends(get_session), _: User = Depends(
     return [ExamOut.model_validate(e) for e in rows]
 
 
-@router.post("", response_model=ExamOut, status_code=201, dependencies=[Depends(_GLOBAL_ADMIN)])
-async def create_exam(payload: ExamIn, db: AsyncSession = Depends(get_session)):
+@router.post("", response_model=ExamOut, status_code=201)
+async def create_exam(
+    payload: ExamIn,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(_GLOBAL_ADMIN),
+):
+    """Create an exam and register it with ExaMetrics.
+
+    The creator is resolved from the session here, not asked for, and travels to
+    ExaMetrics as the key requester — so the exam comes into existence with a
+    working access key and nobody is ever handed one to paste. Provisioning
+    failures are recorded and swallowed: a collection-only deployment, or an
+    ExaMetrics outage, must not stop an exam being created.
+    """
     exam = Exam(
         name=payload.name,
         level_id=payload.level_id,
@@ -145,6 +159,24 @@ async def create_exam(payload: ExamIn, db: AsyncSession = Depends(get_session)):
                     total_marks_practical=100 if subj.has_practical else 0,
                 ))
             await db.flush()
+
+    # Ask ExaMetrics for this exam's access key. Best-effort by design: the exam
+    # is still created if it fails, and the operator can retry from the exam's
+    # processing tab.
+    try:
+        _, failure = await ensure_access_key(db, exam, user)
+    except Exception as exc:  # noqa: BLE001 - provisioning must never fail creation
+        failure = str(exc)
+    if failure:
+        await notifications.record(
+            db,
+            action="PROCESSING_KEY_ISSUE_FAILED",
+            entity_type="exam",
+            entity_id=exam.id,
+            exam_id=exam.id,
+            actor_id=user.id,
+            after={"reason": failure},
+        )
 
     return ExamOut.model_validate(exam)
 

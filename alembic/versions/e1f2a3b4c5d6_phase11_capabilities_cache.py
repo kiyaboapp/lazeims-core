@@ -39,15 +39,17 @@ def upgrade() -> None:
         "exam_processing_links",
         sa.Column("capabilities_fetched_at", sa.DateTime(timezone=True), nullable=True),
     )
-    # Verified tenant name extracted from the identity response.
+    # Verified name of the ExaMetrics exam account, from the identity response.
+    # Spelled ``tenant_exam_name`` because "tenant" alone means a subscribing
+    # school elsewhere in the platform.
     op.add_column(
         "exam_processing_links",
-        sa.Column("tenant_name", sa.String(length=120), nullable=True),
+        sa.Column("tenant_exam_name", sa.String(length=120), nullable=True),
     )
 
 
 def downgrade() -> None:
-    op.drop_column("exam_processing_links", "tenant_name")
+    op.drop_column("exam_processing_links", "tenant_exam_name")
     op.drop_column("exam_processing_links", "capabilities_fetched_at")
     op.drop_column("exam_processing_links", "capabilities_json")
     op.alter_column(

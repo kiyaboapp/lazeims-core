@@ -38,10 +38,19 @@ class Settings(BaseSettings):
     # processing/results features (collection-only deployment).
     backend_sis_base_url: str = ""
     backend_sis_timeout_seconds: int = 120
+    # Zone enrolment secret (``X-Provision-Secret``), issued once by ExaMetrics.
+    # It lets Central ask ExaMetrics for a per-exam API key server-to-server, so
+    # no operator ever handles a key. Empty means keys must be entered by hand.
+    backend_sis_provision_secret: str = ""
 
     @property
     def processing_enabled(self) -> bool:
         return bool(self.backend_sis_base_url.strip())
+
+    @property
+    def provisioning_enabled(self) -> bool:
+        """True when Central can obtain exam keys by itself."""
+        return self.processing_enabled and bool(self.backend_sis_provision_secret.strip())
 
     session_cookie_name: str = "lazeims_session"
     session_ttl_seconds: int = 43_200

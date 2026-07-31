@@ -70,7 +70,10 @@ async def test_link_accepts_key_only(client, monkeypatch):
         body = resp.json()
         assert body["configured"] is True
         assert body["backend_exam_id"] is None
-        assert body["tenant_name"] == "Test Board"
+        # The fake identity response still uses the legacy "tenant" key, which
+        # Central must keep reading for one release (D5).
+        assert body["tenant_exam_name"] == "Test Board"
+        assert body["key_source"] == "MANUAL"
         assert body["capabilities"] == FAKE_IDENTITY_RESPONSE["capabilities"]
         assert body["capabilities_fetched_at"] is not None
         mock_identity.assert_called_once_with("valid-test-key-12345678")
@@ -100,7 +103,7 @@ async def test_link_accepts_key_with_backend_exam_id(client, monkeypatch):
         body = resp.json()
         assert body["configured"] is True
         assert body["backend_exam_id"] == "abc-123-def-456"
-        assert body["tenant_name"] == "Test Board"
+        assert body["tenant_exam_name"] == "Test Board"
     finally:
         get_settings.cache_clear()
 
@@ -157,7 +160,7 @@ async def test_capabilities_endpoint(client, monkeypatch):
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["capabilities"] == FAKE_IDENTITY_RESPONSE["capabilities"]
-        assert body["tenant_name"] == "Test Board"
+        assert body["tenant_exam_name"] == "Test Board"
         assert body["fetched_at"] is not None
     finally:
         get_settings.cache_clear()
@@ -200,6 +203,6 @@ async def test_link_without_processing_enabled(client, monkeypatch):
         mock_identity.assert_not_called()
         # No capabilities cached.
         assert body["capabilities"] is None
-        assert body["tenant_name"] is None
+        assert body["tenant_exam_name"] is None
     finally:
         get_settings.cache_clear()
