@@ -1,9 +1,12 @@
 """ExaMetrics (backend-sis) processing integration endpoints.
 
-LAZEIMS collects; ExaMetrics processes. An EXAM_ADMIN records the per-exam
-ExaMetrics link (backend exam id + purchased API key), submits the collected
-data for processing, polls status, publishes results, and downloads processed
-outputs -- all proxied through Central so the browser never holds the API key.
+LAZEIMS collects; ExaMetrics processes. Central obtains each exam's ExaMetrics
+key itself — on exam creation, or on demand through
+``POST /exams/{exam_id}/processing/access-key`` — so an EXAM_ADMIN never handles
+a key. They submit the collected data for processing, poll status, publish
+results and download processed outputs, all proxied through Central so the
+browser never holds the key. ``PUT /processing/link`` remains as a support-only
+escape hatch for a hand-issued key.
 """
 
 from __future__ import annotations
@@ -31,6 +34,11 @@ from ..schemas_exam import ExamOut
 from ..services import backend_sis
 from ..services.backend_sis import BackendSisError
 from ..services.exam_phase import RESULTS_READY_STATUS, assert_transition_allowed
+from ..services.exametrics_provision import (
+    KEY_SOURCE_PROVISIONED,
+    PROVISIONING_DISABLED,
+    ensure_access_key,
+)
 from ..services.processing_submit import build_collection_payload
 
 router = APIRouter(prefix="/exams", tags=["processing"])
@@ -42,13 +50,38 @@ class ProcessingLinkIn(BaseModel):
 
 
 class ProcessingLinkOut(BaseModel):
+    """Everything the UI may know about a link. Deliberately no ``api_key``:
+    ``key_prefix`` is the only key-derived value that may be displayed."""
+
     configured: bool
     backend_exam_id: str | None = None
     last_submitted_at: datetime | None = None
     last_status: str | None = None
-    tenant_name: str | None = None
+    tenant_exam_name: str | None = None
     capabilities: dict | None = None
     capabilities_fetched_at: datetime | None = None
+    key_source: str | None = None
+    key_prefix: str | None = None
+    key_issued_at: datetime | None = None
+    approval_status: str | None = None
+    approval_note: str | None = None
+
+
+def _link_out(link: ExamProcessingLink) -> ProcessingLinkOut:
+    return ProcessingLinkOut(
+        configured=True,
+        backend_exam_id=link.backend_exam_id,
+        last_submitted_at=link.last_submitted_at,
+        last_status=link.last_status,
+        tenant_exam_name=link.tenant_exam_name,
+        capabilities=link.capabilities_json,
+        capabilities_fetched_at=link.capabilities_fetched_at,
+        key_source=link.key_source,
+        key_prefix=link.key_prefix,
+        key_issued_at=link.key_issued_at,
+        approval_status=link.approval_status,
+        approval_note=link.approval_note,
+    )
 
 
 async def _get_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
@@ -108,15 +141,43 @@ async def get_processing_link(
     link = await _get_link(db, exam_id)
     if link is None:
         return ProcessingLinkOut(configured=False)
-    return ProcessingLinkOut(
-        configured=True,
-        backend_exam_id=link.backend_exam_id,
-        last_submitted_at=link.last_submitted_at,
-        last_status=link.last_status,
-        tenant_name=link.tenant_name,
-        capabilities=link.capabilities_json,
-        capabilities_fetched_at=link.capabilities_fetched_at,
-    )
+    return _link_out(link)
+
+
+@router.post("/{exam_id}/processing/access-key", response_model=ProcessingLinkOut)
+async def request_access_key(
+    exam_id: uuid.UUID,
+    rotate: bool = False,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+):
+    """Ask ExaMetrics for this exam's access key.
+
+    The normal path is automatic — an exam created after this shipped already has
+    a key — so this exists for exams that predate it and for re-issuing one.
+    Nothing is pasted: Central sends the exam details plus the requester's
+    identity and stores the key it gets back. ``rotate=true`` replaces the key in
+    place.
+
+    Collection works as soon as the key arrives; processing and results wait for
+    ExaMetrics to approve the paid scopes, which ``approval_status`` reports.
+    """
+    exam = await _get_exam(db, exam_id)
+    link, failure = await ensure_access_key(db, exam, user, rotate=rotate)
+    if failure == PROVISIONING_DISABLED:
+        raise HTTPException(
+            503,
+            detail={
+                "code": PROVISIONING_DISABLED,
+                "message": (
+                    "This deployment cannot request ExaMetrics keys automatically "
+                    "(no provisioning secret is configured)."
+                ),
+            },
+        )
+    if link is None:
+        raise _sis_http(BackendSisError(failure or "Key provisioning failed."))
+    return _link_out(link)
 
 
 @router.put("/{exam_id}/processing/link", response_model=ProcessingLinkOut)
@@ -126,6 +187,13 @@ async def set_processing_link(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(require_exam_admin()),
 ):
+    """Record a hand-issued key. Support escape hatch only.
+
+    The normal path is ``POST /processing/access-key``, which asks ExaMetrics for
+    a key so nobody has to hold one. This stays for the cases where ExaMetrics
+    staff issued a key out of band; the link is marked ``MANUAL`` so automatic
+    re-provisioning leaves it alone.
+    """
     await _get_exam(db, exam_id)
 
     # Validate the API key against ExaMetrics before persisting.
@@ -151,22 +219,23 @@ async def set_processing_link(
         link.api_key = api_key
         link.configured_by = user.id
 
+    # A hand-entered key is marked MANUAL so re-provisioning never clobbers it.
+    link.key_source = "MANUAL"
+    link.key_prefix = None
+
     # Cache only the capabilities sub-map from the identity response.
     if identity_data is not None:
         link.capabilities_json = identity_data.get("capabilities")
         link.capabilities_fetched_at = datetime.now(timezone.utc)
-        tenant = identity_data.get("tenant")
-        if isinstance(tenant, dict):
-            link.tenant_name = tenant.get("name")
+        tenant_exam = identity_data.get("tenant_exam") or identity_data.get("tenant")
+        if isinstance(tenant_exam, dict):
+            link.tenant_exam_name = tenant_exam.get("name")
+        link.approval_status = identity_data.get("approval_status")
+        link.approval_note = identity_data.get("approval_note")
+        link.key_prefix = identity_data.get("key_prefix")
 
     await db.flush()
-    return ProcessingLinkOut(
-        configured=True, backend_exam_id=link.backend_exam_id,
-        last_submitted_at=link.last_submitted_at, last_status=link.last_status,
-        tenant_name=link.tenant_name,
-        capabilities=link.capabilities_json,
-        capabilities_fetched_at=link.capabilities_fetched_at,
-    )
+    return _link_out(link)
 
 
 # ── Capabilities ─────────────────────────────────────────────────────────────
@@ -180,7 +249,7 @@ async def get_capabilities(
         raise HTTPException(404, detail="No capabilities available for this exam.")
     return {
         "capabilities": link.capabilities_json,
-        "tenant_name": link.tenant_name,
+        "tenant_exam_name": link.tenant_exam_name,
         "fetched_at": link.capabilities_fetched_at,
     }
 
@@ -194,15 +263,31 @@ async def submit_for_processing(
 ):
     """Push the collected data to ExaMetrics, trigger processing, and move the
     exam into PROCESSING. Allowed from ENTRY_LOCKED (first run) or PROCESSING
-    (re-submit after edits)."""
-    exam = await _get_exam(db, exam_id)
-    link = await _require_link(db, exam_id)
+    (re-submit after edits).
 
+    Heals itself first: an exam with no link at all, or one whose provisioned key
+    never got an ExaMetrics exam id, is provisioned here rather than telling the
+    operator to go and configure something. A hand-entered (``MANUAL``) key is
+    left alone.
+    """
+    exam = await _get_exam(db, exam_id)
+
+    # Phase first: a request that cannot proceed must not burn a key rotation,
+    # because the 409 would roll back the link we just wrote while ExaMetrics has
+    # already revoked the key it replaced.
     if exam.phase not in (ExamPhase.ENTRY_LOCKED, ExamPhase.PROCESSING):
         raise HTTPException(
             409,
             f"Submit is only allowed from ENTRY_LOCKED or PROCESSING (current: {exam.phase.value}).",
         )
+
+    existing = await _get_link(db, exam_id)
+    if existing is None or (
+        existing.backend_exam_id is None and existing.key_source == KEY_SOURCE_PROVISIONED
+    ):
+        await ensure_access_key(db, exam, user, rotate=existing is not None)
+
+    link = await _require_link(db, exam_id)
 
     payload = await build_collection_payload(db, exam)
     try:

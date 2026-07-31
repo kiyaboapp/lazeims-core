@@ -39,6 +39,22 @@ def _client(api_key: str) -> httpx.AsyncClient:
     )
 
 
+def _provision_client() -> httpx.AsyncClient:
+    """Client for key issuance, authenticated by the zone enrolment secret.
+
+    Deliberately carries no ``X-API-Key``: this is how Central obtains one in the
+    first place.
+    """
+    secret = get_settings().backend_sis_provision_secret.strip()
+    if not secret:
+        raise BackendSisError("Key provisioning is not configured (backend_sis_provision_secret is empty).")
+    return httpx.AsyncClient(
+        base_url=_base_url(),
+        headers={"X-Provision-Secret": secret},
+        timeout=get_settings().backend_sis_timeout_seconds,
+    )
+
+
 def _unwrap(resp: httpx.Response) -> Any:
     if resp.status_code >= 400:
         try:
@@ -71,12 +87,24 @@ async def extract_registrations(api_key: str, filename: str, content: bytes, con
         return _unwrap(resp)
 
 
+async def provision_exam(payload: dict) -> dict:
+    """Register an exam with ExaMetrics and receive its API key.
+
+    Server-to-server: the response carries the secret exactly once, so it is
+    stored on the exam's :class:`ExamProcessingLink` and never returned to a
+    browser or written to an audit record.
+    """
+    async with _provision_client() as client:
+        resp = await client.post("/integration/provision", json=payload)
+        return _unwrap(resp) or {}
+
+
 async def identity(api_key: str) -> dict:
-    """Validate a key and fetch tenant/capabilities via GET /integration/me.
+    """Validate a key and fetch the exam account/capabilities via GET /integration/me.
 
     Unlike other methods, this endpoint has no exam_id in the path. It returns
-    the tenant info, capabilities map, and contract version for the given key.
-    Raises BackendSisError on any non-2xx response.
+    the ``tenant_exam`` info, capabilities map, and contract version for the
+    given key. Raises BackendSisError on any non-2xx response.
     """
     async with _client(api_key) as client:
         resp = await client.get("/integration/me")
