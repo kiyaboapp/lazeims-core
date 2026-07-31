@@ -138,7 +138,7 @@ async def test_de_credential_shown_once(client):
     exam_id = ctx["exam_id"]
     st = await _create_station(client, h, exam_id)
     # appoint a DE and issue a station credential
-    users = (await client.get("/api/v1/registry/users", headers=h)).json()
+    users = (await client.get("/api/v1/registry/users", headers=h)).json()["items"]
     owner_id = next(u["id"] for u in users if u["username"] == "examowner")
     ra = await _post(client, f"exams/{exam_id}/role-assignments",
                      {"user_id": owner_id, "role": "DATA_ENTERER"}, h)
@@ -153,7 +153,7 @@ async def test_de_credential_requires_initials(client):
     ctx = await _build_two_school_two_subject_exam(client, h)
     exam_id = ctx["exam_id"]
     st = await _create_station(client, h, exam_id)
-    users = (await client.get("/api/v1/registry/users", headers=h)).json()
+    users = (await client.get("/api/v1/registry/users", headers=h)).json()["items"]
     owner_id = next(u["id"] for u in users if u["username"] == "examowner")
     ra = await _post(client, f"exams/{exam_id}/role-assignments",
                      {"user_id": owner_id, "role": "DATA_ENTERER"}, h)

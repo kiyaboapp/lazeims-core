@@ -45,7 +45,7 @@ async def _post(client, path, json, h, expect=201):
     return r.json()
 
 
-def _station_bundle(exam_code):
+def _station_bundle(exam_id):
     seed = {
         "schools": [{"centre_number": "SCH-1", "name": "S1"}],
         "subjects": [{"subject_code": "011", "name": "H", "papers": ["THEORY1"],
@@ -56,7 +56,7 @@ def _station_bundle(exam_code):
     }
     return {"manifest": {"contract_version": "station-package/v1", "package_id": "PKGID", "package_version": 1,
                          "rules_version": "1.0", "software_min_version": "1.0.0", "station_code": "ST-1",
-                         "exam_code": exam_code, "configuration_hash": sha256_prefixed(seed),
+                         "exam_id": exam_id, "configuration_hash": sha256_prefixed(seed),
                          "issued_at": "2026-07-27T08:00:00Z",
                          "scope": {"schools": ["SCH-1"], "subjects": ["011"], "papers": ["THEORY1"]}, "signature": "x"},
             "seed": seed}
@@ -68,8 +68,7 @@ async def test_station_events_apply_on_central_and_reconcile(client, tmp_path):
     h = await _admin(client)
     school = (await _reg(client, "schools", {"centre_number": "SCH-1", "name": "S1"}, h))["id"]
     subject = (await _reg(client, "subjects", {"code": "011", "name": "H"}, h))["id"]
-    exam_id = (await _post(client, "exams", {"name": "E", "exam_code": f"EX-{uuid.uuid4().hex[:6]}", "level_id": 1}, h))["id"]
-    exam_code = (await client.get(f"/api/v1/exams/{exam_id}")).json()["exam_code"]
+    exam_id = (await _post(client, "exams", {"name": "E", "exam_id": f"EX-{uuid.uuid4().hex[:6]}", "level_id": 1}, h))["id"]
     await _post(client, f"exams/{exam_id}/schools", {"school_id": school}, h)
     es = (await _post(client, f"exams/{exam_id}/subjects", {"subject_id": subject, "total_marks_theory1": 100}, h))["id"]
     await _post(client, f"exams/{exam_id}/students",
@@ -83,7 +82,7 @@ async def test_station_events_apply_on_central_and_reconcile(client, tmp_path):
     await _post(client, f"exams/{exam_id}/transitions", {"target_phase": "ENTRY_OPEN"}, h, expect=200)
 
     # --- Station side: real local entry produces outbox events ---
-    bundle = _station_bundle(exam_code)
+    bundle = _station_bundle(exam_id)
     bundle["manifest"]["package_id"] = pkg["package_id"]
     bundle["manifest"]["configuration_hash"] = sha256_prefixed(bundle["seed"])
     sconn = st_connect(tmp_path / "s.sqlite3")

@@ -156,5 +156,5 @@ async def test_snapshot_get_returns_manifest(client):
     snap = (await client.post(f"/api/v1/exams/{ctx['exam_id']}/collection-snapshots", headers=h)).json()
     g = await client.get(f"/api/v1/collection-snapshots/{snap['snapshot_id']}", headers=h)
     assert g.status_code == 200
-    assert g.json()["manifest"]["exam_code"]
+    assert g.json()["manifest"]["exam_id"] == ctx["exam_id"]
     assert g.json()["manifest"]["total_marks"] == 1

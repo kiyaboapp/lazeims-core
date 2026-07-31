@@ -30,9 +30,7 @@ async def _setup_station_exam(client, h):
     """Exam with a STATION-owned scope, open for entry; returns keys + package."""
     school = (await _reg(client, "schools", {"centre_number": "SCH-1", "name": "S1"}, h))["id"]
     subject = (await _reg(client, "subjects", {"code": "011", "name": "Hist"}, h))["id"]
-    exam_id = (await _post(client, "exams", {"name": "E", "exam_code": f"EX-{uuid.uuid4().hex[:6]}", "level_id": 1}, h))["id"]
-    exam = await client.get(f"/api/v1/exams/{exam_id}")
-    exam_code = exam.json()["exam_code"]
+    exam_id = (await _post(client, "exams", {"name": "E", "exam_id": f"EX-{uuid.uuid4().hex[:6]}", "level_id": 1}, h))["id"]
     await _post(client, f"exams/{exam_id}/schools", {"school_id": school}, h)
     es = (await _post(client, f"exams/{exam_id}/subjects", {"subject_id": subject, "total_marks_theory1": 100}, h))["id"]
     await _post(client, f"exams/{exam_id}/students",
@@ -47,28 +45,28 @@ async def _setup_station_exam(client, h):
     pkg = await _post(client, f"exams/{exam_id}/stations/{st['station_id']}/packages",
                       {"schools": ["SCH-1"], "subjects": ["011"], "papers": ["THEORY1"]}, h)
     await _post(client, f"exams/{exam_id}/transitions", {"target_phase": "ENTRY_OPEN"}, h, expect=200)
-    return {"exam_id": exam_id, "exam_code": exam_code, "es": es, "station_key": station_key,
+    return {"exam_id": exam_id, "es": es, "station_key": station_key,
             "package_id": pkg["package_id"], "package_version": pkg["package_version"]}
 
 
-def _nk(exam_code, student="S-1", subject="011", paper="THEORY1"):
-    return {"exam_code": exam_code, "student_id": student, "subject_code": subject, "paper_type": paper}
+def _nk(exam_id, student="S-1", subject="011", paper="THEORY1"):
+    return {"exam_id": exam_id, "student_id": student, "subject_code": subject, "paper_type": paper}
 
 
 def _att_event(ctx, eid, present=True):
     return {"event_id": eid, "entity_type": "ATTENDANCE_TRANSCRIBED", "operation": "UPSERT",
-            "natural_key": _nk(ctx["exam_code"]), "value": {"is_present": present, "source": "INVIGILATOR_ISAL_TRANSCRIPTION"},
+            "natural_key": _nk(ctx["exam_id"]), "value": {"is_present": present, "source": "INVIGILATOR_ISAL_TRANSCRIPTION"},
             "local_version": 1, "actor_assignment_id": "a", "occurred_at": "2026-07-27T08:00:00Z"}
 
 
 def _marks_event(ctx, eid, total="67"):
     return {"event_id": eid, "entity_type": "STUDENT_PAPER_MARKS_REPLACED", "operation": "UPSERT",
-            "natural_key": _nk(ctx["exam_code"]), "value": {"mode": "TOTAL_MARKS", "total": total},
+            "natural_key": _nk(ctx["exam_id"]), "value": {"mode": "TOTAL_MARKS", "total": total},
             "local_version": 2, "actor_assignment_id": "a", "occurred_at": "2026-07-27T08:01:00Z"}
 
 
 async def _sync(client, ctx, events):
-    body = {"contract_version": "station-sync/v1", "station_code": "ST-1", "exam_code": ctx["exam_code"],
+    body = {"contract_version": "station-sync/v1", "station_code": "ST-1", "exam_id": ctx["exam_id"],
             "package_id": ctx["package_id"], "package_version": ctx["package_version"],
             "rules_version": "1.0", "events": events}
     return await client.post("/api/v1/station/sync/events", json=body,

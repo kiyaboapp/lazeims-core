@@ -15,7 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_DB_URL = "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/lazeims_test"
+TEST_DB_URL = os.environ["DATABASE_URL"]
 
 
 async def _reset_schema() -> None:

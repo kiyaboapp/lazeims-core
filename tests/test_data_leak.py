@@ -41,7 +41,7 @@ async def test_exam_admin_of_one_exam_cannot_admin_another(client):
     h = await _admin(client)
     exam_a = (await _post(client, "exams", {"name": "A", "exam_code": f"A-{uuid.uuid4().hex[:6]}", "level_id": 1}, h))["id"]
     exam_b = (await _post(client, "exams", {"name": "B", "exam_code": f"B-{uuid.uuid4().hex[:6]}", "level_id": 1}, h))["id"]
-    users = (await client.get("/api/v1/registry/users", headers=h)).json()
+    users = (await client.get("/api/v1/registry/users", headers=h)).json()["items"]
     owner_id = next(u["id"] for u in users if u["username"] == "examowner")
     # examowner is EXAM_ADMIN on A only
     await _post(client, f"exams/{exam_a}/role-assignments", {"user_id": owner_id, "role": "EXAM_ADMIN"}, h)

@@ -240,7 +240,7 @@ async def test_exam_admin_assignment_grants_access(client):
     h_admin = await _admin(client)
     exam_id = await _create_exam(client, h_admin)
     # find examowner user id
-    users = (await client.get("/api/v1/registry/users", headers=h_admin)).json()
+    users = (await client.get("/api/v1/registry/users", headers=h_admin)).json()["items"]
     owner_id = next(u["id"] for u in users if u["username"] == "examowner")
     # appoint examowner as EXAM_ADMIN
     r = await _mk(client, f"exams/{exam_id}/role-assignments",
@@ -262,7 +262,7 @@ async def test_client_supplied_role_not_trusted(client):
     # try; role is resolved from assignment, not request.
     h_admin = await _admin(client)
     exam_id = await _create_exam(client, h_admin)
-    users = (await client.get("/api/v1/registry/users", headers=h_admin)).json()
+    users = (await client.get("/api/v1/registry/users", headers=h_admin)).json()["items"]
     owner_id = next(u["id"] for u in users if u["username"] == "examowner")
     await _mk(client, f"exams/{exam_id}/role-assignments",
               {"user_id": owner_id, "role": "DATA_ENTERER"}, h_admin)

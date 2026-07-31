@@ -46,7 +46,7 @@ async def _full_flow(client, h):
     await _post(client, f"exams/{exam_id}/students",
                 {"student_id": "S-1", "school_id": school, "first_name": "A", "surname": "B", "sex": "M", "subject_ids": [es]}, h)
     # role assignment (examowner)
-    users = (await client.get("/api/v1/registry/users", headers=h)).json()
+    users = (await client.get("/api/v1/registry/users", headers=h)).json()["items"]
     owner_id = next(u["id"] for u in users if u["username"] == "examowner")
     await _post(client, f"exams/{exam_id}/role-assignments", {"user_id": owner_id, "role": "DATA_ENTERER"}, h)
     await client.put(f"/api/v1/exams/{exam_id}/writer-assignments", json={
@@ -169,7 +169,6 @@ async def test_sync_rejected_emits_notification_and_audit(client):
     school = (await _reg(client, "schools", {"centre_number": "SCH-1", "name": "S1"}, h))["id"]
     subject = (await _reg(client, "subjects", {"code": "011", "name": "H"}, h))["id"]
     exam_id = (await _post(client, "exams", {"name": "E", "exam_code": f"EX-{uuid.uuid4().hex[:6]}", "level_id": 1}, h))["id"]
-    exam_code = (await client.get(f"/api/v1/exams/{exam_id}")).json()["exam_code"]
     await _post(client, f"exams/{exam_id}/schools", {"school_id": school}, h)
     es = (await _post(client, f"exams/{exam_id}/subjects", {"subject_id": subject, "total_marks_theory1": 100}, h))["id"]
     await _post(client, f"exams/{exam_id}/students",
@@ -183,10 +182,10 @@ async def test_sync_rejected_emits_notification_and_audit(client):
     await _post(client, f"exams/{exam_id}/transitions", {"target_phase": "ENTRY_OPEN"}, h, expect=200)
     # marks before attendance -> rejected
     ev = {"event_id": "evt_r", "entity_type": "STUDENT_PAPER_MARKS_REPLACED", "operation": "UPSERT",
-          "natural_key": {"exam_code": exam_code, "student_id": "S-1", "subject_code": "011", "paper_type": "THEORY1"},
+          "natural_key": {"exam_id": exam_id, "student_id": "S-1", "subject_code": "011", "paper_type": "THEORY1"},
           "value": {"mode": "TOTAL_MARKS", "total": "50"}, "local_version": 1,
           "actor_assignment_id": "a", "occurred_at": "2026-07-27T08:00:00Z"}
-    body = {"contract_version": "station-sync/v1", "station_code": "ST-1", "exam_code": exam_code,
+    body = {"contract_version": "station-sync/v1", "station_code": "ST-1", "exam_id": exam_id,
             "package_id": pkg["package_id"], "package_version": pkg["package_version"], "rules_version": "1.0",
             "events": [ev]}
     r = await client.post("/api/v1/station/sync/events", json=body, headers={"X-Station-Key": st["sync_key"]})

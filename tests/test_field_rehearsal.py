@@ -43,8 +43,7 @@ async def test_station_field_rehearsal(client, tmp_path):
     # 1. Central setup: STATION-owned scope, open entry, generate package
     school = (await client.post("/api/v1/registry/schools", json={"centre_number": "SCH-FR", "name": "Rehearsal Centre"}, headers=h)).json()["id"]
     subject = (await client.post("/api/v1/registry/subjects", json={"code": "011", "name": "History"}, headers=h)).json()["id"]
-    exam_id = (await post("/exams", {"name": "Field Rehearsal", "exam_code": f"FR-{uuid.uuid4().hex[:6]}", "level_id": 1}))["id"]
-    exam_code = (await client.get(f"/api/v1/exams/{exam_id}", headers=h)).json()["exam_code"]
+    exam_id = (await post("/exams", {"name": "Field Rehearsal", "exam_id": f"FR-{uuid.uuid4().hex[:6]}", "level_id": 1}))["id"]
     await post(f"/exams/{exam_id}/schools", {"school_id": school})
     es = (await post(f"/exams/{exam_id}/subjects", {"subject_id": subject, "total_marks_theory1": 100}))["id"]
     await post(f"/exams/{exam_id}/students", {"student_id": "S-1", "school_id": school, "first_name": "A", "surname": "B", "sex": "M", "subject_ids": [es]})
@@ -68,7 +67,7 @@ async def test_station_field_rehearsal(client, tmp_path):
     assert len(events) == 3  # attendance, marks, finalize
 
     # 3. Station -> Central sync over HTTP
-    body = {"contract_version": "station-sync/v1", "station_code": "ST-FR-1", "exam_code": exam_code,
+    body = {"contract_version": "station-sync/v1", "station_code": "ST-FR-1", "exam_id": exam_id,
             "package_id": pkg["package_id"], "package_version": pkg["package_version"], "rules_version": "1.0", "events": events}
     resp = await client.post("/api/v1/station/sync/events", json=body, headers={"X-Station-Key": sync_key})
     assert resp.status_code == 200, resp.text
