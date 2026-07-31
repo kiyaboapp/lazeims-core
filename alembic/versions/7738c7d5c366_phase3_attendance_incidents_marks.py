@@ -9,6 +9,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 revision: str = '7738c7d5c366'
 down_revision: Union[str, None] = 'b98b4d7e3975'
@@ -21,7 +22,7 @@ def upgrade() -> None:
     op.create_table('mark_batch_receipts',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('idempotency_key', sa.String(length=120), nullable=False),
-    sa.Column('exam_id', sa.Integer(), nullable=False),
+    sa.Column('exam_id', PG_UUID(as_uuid=True), nullable=False),
     sa.Column('actor_id', sa.Integer(), nullable=True),
     sa.Column('payload_hash', sa.String(length=80), nullable=False),
     sa.Column('result_snapshot', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
@@ -51,7 +52,7 @@ def upgrade() -> None:
     op.create_index(op.f('ix_attendance_exam_student_subject_id'), 'attendance', ['exam_student_subject_id'], unique=False)
     op.create_table('exam_incidents',
     sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('exam_id', sa.Integer(), nullable=False),
+    sa.Column('exam_id', PG_UUID(as_uuid=True), nullable=False),
     sa.Column('exam_student_subject_id', sa.Integer(), nullable=True),
     sa.Column('school_id', sa.Integer(), nullable=True),
     sa.Column('exam_subject_id', sa.Integer(), nullable=True),

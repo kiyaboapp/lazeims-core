@@ -9,6 +9,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 revision: str = '162f0de8f093'
 down_revision: Union[str, None] = 'c6c9107e7a65'
@@ -21,7 +22,7 @@ def upgrade() -> None:
     op.create_table('audit_logs',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('actor_id', sa.Integer(), nullable=True),
-    sa.Column('exam_id', sa.Integer(), nullable=True),
+    sa.Column('exam_id', PG_UUID(as_uuid=True), nullable=True),
     sa.Column('action', sa.String(length=60), nullable=False),
     sa.Column('entity_type', sa.String(length=60), nullable=False),
     sa.Column('entity_id', sa.String(length=120), nullable=True),
@@ -38,7 +39,7 @@ def upgrade() -> None:
     op.create_table('notifications',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('user_id', sa.Integer(), nullable=True),
-    sa.Column('exam_id', sa.Integer(), nullable=True),
+    sa.Column('exam_id', PG_UUID(as_uuid=True), nullable=True),
     sa.Column('station_id', sa.Integer(), nullable=True),
     sa.Column('type', sa.String(length=40), nullable=False),
     sa.Column('severity', sa.String(length=20), nullable=False),
