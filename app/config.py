@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     # no operator ever handles a key. Empty means keys must be entered by hand.
     backend_sis_provision_secret: str = ""
 
+    # Comma-separated list of base64 Fernet keys for encrypting API keys at rest.
+    # The first key encrypts; all keys decrypt (supports rotation). When empty,
+    # a key is derived from session_secret_key so existing deployments do not
+    # break on upgrade.
+    processing_key_encryption_keys: str = ""
+
+    # Public base URL of this Central instance, used for webhook callback
+    # registration. Empty disables webhook registration.
+    central_public_base_url: str = ""
+
     @property
     def processing_enabled(self) -> bool:
         return bool(self.backend_sis_base_url.strip())

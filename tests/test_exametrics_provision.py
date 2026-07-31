@@ -373,15 +373,42 @@ async def test_exam_creation_still_201_with_provisioning_disabled(client):
 # ── Self-healing on submit ───────────────────────────────────────────────────
 
 async def _seed_link(exam_id, **kwargs):
-    """Commit a link and put the exam in ENTRY_LOCKED so submit can run."""
+    """Commit a link and put the exam in ENTRY_LOCKED so submit can run.
+
+    Also creates a sealed snapshot and an APPROVED processing request so the
+    C7 phase guard passes (submit requires APPROVED for current revision).
+    """
     from app.db import get_sessionmaker
     from app.models.exam import Exam
+    from app.models.collection import CollectionSnapshot
+    from app.models.processing import ExamProcessingRequest
     from lazeims_common.enums import ExamPhase
 
     async with get_sessionmaker()() as db:
         exam = await db.get(Exam, uuid.UUID(exam_id))
         exam.phase = ExamPhase.ENTRY_LOCKED
+        exam.closeout_revision = 1
         db.add(ExamProcessingLink(exam_id=uuid.UUID(exam_id), **kwargs))
+        # Sealed snapshot + approved request for C7 phase guard.
+        snap = CollectionSnapshot(
+            snapshot_id=str(uuid.uuid4()),
+            exam_id=uuid.UUID(exam_id),
+            closeout_revision=1,
+            configuration_hash="sha256:test_config",
+            content_hash="sha256:test_content",
+            status="SEALED",
+            manifest={"schools": 1, "subjects": 1, "students": 1},
+            sealed_by=1,
+        )
+        db.add(snap)
+        req = ExamProcessingRequest(
+            exam_id=uuid.UUID(exam_id),
+            request_id=f"prq_provision_test_{uuid.uuid4().hex[:8]}",
+            state="APPROVED",
+            closeout_revision=1,
+            configuration_hash="sha256:test_config",
+        )
+        db.add(req)
         await db.commit()
 
 

@@ -29,6 +29,7 @@ from .routers import registration as registration_router
 from .routers import routers_registry as registry_router
 from .routers import station_sync as station_sync_router
 from .routers import stations as stations_router
+from .routers import webhooks as webhooks_router
 
 API_PREFIX = "/api/v1"
 
@@ -104,6 +105,7 @@ def create_app() -> FastAPI:
     app.include_router(closeout_router.router, prefix=API_PREFIX)
     app.include_router(closeout_router.snapshots_router, prefix=API_PREFIX)
     app.include_router(notifications_router.router, prefix=API_PREFIX)
+    app.include_router(webhooks_router.router, prefix=API_PREFIX)
     return app
 
 

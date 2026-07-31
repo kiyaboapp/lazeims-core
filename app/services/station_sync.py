@@ -179,8 +179,30 @@ async def process_events(
     """Process a batch; return the SyncResponse dict (per-event outcomes)."""
     accepted, duplicates, rejected = [], [], []
 
+    # Phase gate: reject events when the exam is past ENTRY_LOCKED (section 10.2).
+    from lazeims_common.enums import ExamPhase as _EP
+    exam = await db.get(Exam, exam_id)
+    phase_closed = exam is not None and exam.phase not in (_EP.ENTRY_OPEN, _EP.ENTRY_LOCKED)
+
     for event in events:
         event_id = event["event_id"]
+
+        # If the exam phase does not allow writes, reject per-event so
+        # other events in the batch still get dedupe-checked.
+        if phase_closed:
+            payload_hash = sha256_prefixed(event.get("value"))
+            existing = await db.get(SyncEventReceipt, event_id)
+            if existing is not None:
+                if existing.payload_hash and existing.payload_hash != payload_hash:
+                    rejected.append({"event_id": event_id, "code": RejectionCode.EVENT_ID_PAYLOAD_CONFLICT.value,
+                                     "message": "Event id already used with a different payload."})
+                else:
+                    duplicates.append({"event_id": event_id})
+                continue
+            rejected.append({"event_id": event_id, "code": "PHASE_NOT_OPEN",
+                             "message": f"Exam is past ENTRY_LOCKED (current: {exam.phase.value}). No new data accepted."})
+            continue
+
         payload_hash = sha256_prefixed(event.get("value"))
         existing = await db.get(SyncEventReceipt, event_id)
         if existing is not None:

@@ -189,9 +189,11 @@ async def assert_transition_allowed(db: AsyncSession, exam: Exam, target: ExamPh
                 readiness.as_dict(),
             )
 
-    # Handing off to ExaMetrics requires a configured processing link.
+    # Handing off to ExaMetrics requires an APPROVED processing request for the
+    # current closeout_revision and configuration_hash (C7 phase guard).
     if target == ExamPhase.PROCESSING:
-        from ..models.processing import ExamProcessingLink
+        from ..models.processing import ExamProcessingLink, ExamProcessingRequest
+        from ..models.collection import CollectionSnapshot
 
         link = (
             await db.execute(select(ExamProcessingLink).where(ExamProcessingLink.exam_id == exam.id))
@@ -201,6 +203,46 @@ async def assert_transition_allowed(db: AsyncSession, exam: Exam, target: ExamPh
                 RejectionCode.CONFIGURATION_MISMATCH,
                 "Processing is not configured for this exam. Add the ExaMetrics exam id and API key first.",
                 {"exam_id": str(exam.id)},
+            )
+
+        # Find the current sealed snapshot to get revision and hash.
+        snap = (
+            await db.execute(
+                select(CollectionSnapshot)
+                .where(
+                    CollectionSnapshot.exam_id == exam.id,
+                    CollectionSnapshot.status == "SEALED",
+                )
+                .order_by(CollectionSnapshot.closeout_revision.desc())
+            )
+        ).scalars().first()
+        if snap is None:
+            raise ValidationError(
+                RejectionCode.CONFIGURATION_MISMATCH,
+                "No sealed collection snapshot exists for this exam.",
+                {"exam_id": str(exam.id)},
+            )
+
+        # Require an APPROVED request matching current revision AND hash.
+        req = (
+            await db.execute(
+                select(ExamProcessingRequest).where(
+                    ExamProcessingRequest.exam_id == exam.id,
+                    ExamProcessingRequest.closeout_revision == snap.closeout_revision,
+                    ExamProcessingRequest.configuration_hash == snap.configuration_hash,
+                    ExamProcessingRequest.state == "APPROVED",
+                )
+            )
+        ).scalar_one_or_none()
+        if req is None:
+            raise ValidationError(
+                RejectionCode.CONFIGURATION_MISMATCH,
+                "Processing requires an APPROVED request matching the current closeout revision and configuration hash.",
+                {
+                    "exam_id": str(exam.id),
+                    "closeout_revision": snap.closeout_revision,
+                    "configuration_hash": snap.configuration_hash,
+                },
             )
 
     # Publishing requires ExaMetrics to have confirmed results are ready.

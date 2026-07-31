@@ -114,7 +114,7 @@ async def test_invalid_key_rejected_on_save(client, monkeypatch):
     h = await _admin(client)
     exam_id = await _create_exam(client, h)
 
-    mock_identity = AsyncMock(side_effect=BackendSisError("Invalid API key", status_code=401))
+    mock_identity = AsyncMock(side_effect=BackendSisError("Invalid API key", status_code=401, code="INVALID_KEY"))
     monkeypatch.setattr("app.routers.integration.backend_sis.identity", mock_identity)
     monkeypatch.setenv("BACKEND_SIS_BASE_URL", "http://fake-exametrics.test")
     from app.config import get_settings
@@ -126,10 +126,10 @@ async def test_invalid_key_rejected_on_save(client, monkeypatch):
             json={"api_key": "bad-key-12345678"},
             headers=h,
         )
-        assert resp.status_code == 502
+        # D9: 401 is a passthrough code, so it is preserved (not 502).
+        assert resp.status_code == 401
         body = resp.json()
-        assert body["detail"]["code"] == "EXAMETRICS_ERROR"
-        assert body["detail"]["upstream_status"] == 401
+        assert body["detail"]["code"] == "INVALID_KEY"
     finally:
         get_settings.cache_clear()
 

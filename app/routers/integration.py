@@ -28,7 +28,7 @@ from ..db import get_session
 from ..deps import current_user
 from ..deps_exam import require_exam_admin
 from ..models.exam import Exam
-from ..models.processing import ExamProcessingLink
+from ..models.processing import ExamProcessingLink, ExamProcessingRequest
 from ..models.registry import User
 from ..schemas_exam import ExamOut
 from ..services import backend_sis
@@ -127,10 +127,23 @@ async def _require_link(db: AsyncSession, exam_id: uuid.UUID) -> ExamProcessingL
 
 
 def _sis_http(exc: BackendSisError) -> HTTPException:
-    return HTTPException(
-        status_code=502,
-        detail={"code": "EXAMETRICS_ERROR", "message": str(exc), "upstream_status": exc.status_code},
-    )
+    """Map a BackendSisError to an HTTPException preserving upstream codes (D9).
+
+    Known upstream statuses (401/402/403/409/413/422/429/503) are preserved so
+    the caller and the frontend can act on them. Unknown statuses become 502.
+    """
+    # Use the upstream status if it is in the passthrough set, else 502.
+    passthrough = {401, 402, 403, 409, 413, 422, 429, 503}
+    status = exc.status_code if exc.status_code in passthrough else 502
+    detail: dict[str, Any] = {
+        "code": exc.code or "EXAMETRICS_ERROR",
+        "message": str(exc),
+    }
+    if exc.details:
+        detail["details"] = exc.details
+    if exc.status_code and exc.status_code not in passthrough:
+        detail["upstream_status"] = exc.status_code
+    return HTTPException(status_code=status, detail=detail)
 
 
 # ── Link configuration ──────────────────────────────────────────────────────
@@ -456,3 +469,208 @@ async def extract_registrations(
         )
     except BackendSisError as exc:
         raise _sis_http(exc)
+
+
+# ── Processing Requests (C6) ─────────────────────────────────────────────────
+
+class ProcessingRequestOut(BaseModel):
+    id: int
+    request_id: str
+    state: str
+    closeout_revision: int
+    configuration_hash: str
+    quote_json: dict | None = None
+    run_id: str | None = None
+    decided_at: datetime | None = None
+    decision_reason: str | None = None
+    last_polled_at: datetime | None = None
+
+
+@router.post("/{exam_id}/processing/requests")
+async def create_processing_request(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+):
+    """Request processing approval from ExaMetrics for this exam's current
+    sealed snapshot (closeout_revision + configuration_hash).
+
+    Idempotent on (exam, revision, hash) -- a repeat returns the existing
+    request rather than creating a second one.
+    """
+    from ..models.collection import CollectionSnapshot
+
+    exam = await _get_exam(db, exam_id)
+    link = await _require_link(db, exam_id)
+
+    # Get the current sealed snapshot.
+    snap = (
+        await db.execute(
+            select(CollectionSnapshot)
+            .where(
+                CollectionSnapshot.exam_id == exam_id,
+                CollectionSnapshot.status == "SEALED",
+            )
+            .order_by(CollectionSnapshot.closeout_revision.desc())
+        )
+    ).scalars().first()
+    if snap is None:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "NO_SEALED_SNAPSHOT",
+                "message": "Seal a collection snapshot before requesting processing.",
+            },
+        )
+
+    revision = snap.closeout_revision
+    config_hash = snap.configuration_hash
+
+    # Check for existing request at this revision+hash (idempotent).
+    existing = (
+        await db.execute(
+            select(ExamProcessingRequest).where(
+                ExamProcessingRequest.exam_id == exam_id,
+                ExamProcessingRequest.closeout_revision == revision,
+                ExamProcessingRequest.configuration_hash == config_hash,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return ProcessingRequestOut(
+            id=existing.id, request_id=existing.request_id, state=existing.state,
+            closeout_revision=existing.closeout_revision,
+            configuration_hash=existing.configuration_hash,
+            quote_json=existing.quote_json, run_id=existing.run_id,
+            decided_at=existing.decided_at, decision_reason=existing.decision_reason,
+            last_polled_at=existing.last_polled_at,
+        )
+
+    # Call ExaMetrics to create the request.
+    try:
+        remote = await backend_sis.request_processing(
+            link.api_key, link.backend_exam_id,
+            {"closeout_revision": revision, "configuration_hash": config_hash},
+        )
+    except BackendSisError as exc:
+        raise _sis_http(exc)
+
+    req = ExamProcessingRequest(
+        exam_id=exam_id,
+        request_id=remote.get("request_id", str(uuid.uuid4())),
+        state=remote.get("state", "PENDING_APPROVAL"),
+        closeout_revision=revision,
+        configuration_hash=config_hash,
+        quote_json=remote.get("quote"),
+        requested_by=user.id,
+        last_polled_at=datetime.now(timezone.utc),
+    )
+    db.add(req)
+    await db.flush()
+
+    # Audit the request creation.
+    from ..services import notifications as notif
+    await notif.record(
+        db, action="PROCESSING_REQUESTED", entity_type="exam_processing_request",
+        entity_id=req.request_id, actor_id=user.id, exam_id=exam_id,
+        after={"request_id": req.request_id, "state": req.state,
+               "closeout_revision": revision, "configuration_hash": config_hash},
+    )
+
+    return ProcessingRequestOut(
+        id=req.id, request_id=req.request_id, state=req.state,
+        closeout_revision=req.closeout_revision,
+        configuration_hash=req.configuration_hash,
+        quote_json=req.quote_json, run_id=req.run_id,
+        decided_at=req.decided_at, decision_reason=req.decision_reason,
+        last_polled_at=req.last_polled_at,
+    )
+
+
+@router.get("/{exam_id}/processing/requests")
+async def list_processing_requests(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(current_user),
+):
+    """List all processing requests for an exam."""
+    rows = (
+        await db.execute(
+            select(ExamProcessingRequest)
+            .where(ExamProcessingRequest.exam_id == exam_id)
+            .order_by(ExamProcessingRequest.id.desc())
+        )
+    ).scalars().all()
+    return [
+        ProcessingRequestOut(
+            id=r.id, request_id=r.request_id, state=r.state,
+            closeout_revision=r.closeout_revision,
+            configuration_hash=r.configuration_hash,
+            quote_json=r.quote_json, run_id=r.run_id,
+            decided_at=r.decided_at, decision_reason=r.decision_reason,
+            last_polled_at=r.last_polled_at,
+        )
+        for r in rows
+    ]
+
+
+@router.post("/{exam_id}/processing/requests/{request_id}/refresh")
+async def refresh_processing_request(
+    exam_id: uuid.UUID,
+    request_id: str,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+):
+    """Poll ExaMetrics for the latest state of a processing request."""
+    link = await _require_link(db, exam_id)
+    req = (
+        await db.execute(
+            select(ExamProcessingRequest).where(
+                ExamProcessingRequest.exam_id == exam_id,
+                ExamProcessingRequest.request_id == request_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if req is None:
+        raise HTTPException(404, "Processing request not found")
+
+    try:
+        remote = await backend_sis.get_processing_request(
+            link.api_key, link.backend_exam_id, request_id
+        )
+    except BackendSisError as exc:
+        raise _sis_http(exc)
+
+    old_state = req.state
+    new_state = remote.get("state", req.state)
+    req.state = new_state
+    req.last_polled_at = datetime.now(timezone.utc)
+    if remote.get("run_id"):
+        req.run_id = remote["run_id"]
+    if remote.get("decided_at"):
+        req.decided_at = datetime.fromisoformat(remote["decided_at"]) if isinstance(remote["decided_at"], str) else remote["decided_at"]
+    if remote.get("decision_reason"):
+        req.decision_reason = remote["decision_reason"]
+    if remote.get("quote"):
+        req.quote_json = remote["quote"]
+
+    await db.flush()
+
+    # Audit state change.
+    if old_state != new_state:
+        from ..services import notifications as notif
+        await notif.record(
+            db, action="PROCESSING_STATE_CHANGED", entity_type="exam_processing_request",
+            entity_id=req.request_id, actor_id=user.id, exam_id=exam_id,
+            before={"state": old_state},
+            after={"state": new_state, "request_id": req.request_id},
+        )
+
+    return ProcessingRequestOut(
+        id=req.id, request_id=req.request_id, state=req.state,
+        closeout_revision=req.closeout_revision,
+        configuration_hash=req.configuration_hash,
+        quote_json=req.quote_json, run_id=req.run_id,
+        decided_at=req.decided_at, decision_reason=req.decision_reason,
+        last_polled_at=req.last_polled_at,
+    )
