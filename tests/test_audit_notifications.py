@@ -60,6 +60,8 @@ async def _full_flow(client, h):
         headers={**h, **_key()})
     await client.post(f"/api/v1/exams/{exam_id}/scopes/finalize", json={
         "school_id": school, "exam_subject_id": es, "paper_type": "THEORY1"}, headers=h)
+    # Transition to ENTRY_LOCKED before sealing (required by phase gate).
+    await client.post(f"/api/v1/exams/{exam_id}/transitions", json={"target_phase": "ENTRY_LOCKED"}, headers=h)
     await client.post(f"/api/v1/exams/{exam_id}/collection-snapshots", headers=h)
     return {"exam_id": exam_id, "owner_id": owner_id}
 

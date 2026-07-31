@@ -54,6 +54,19 @@ async def create_readiness_run(exam_id: uuid.UUID, db: AsyncSession = Depends(ge
 @router.post("/{exam_id}/collection-snapshots")
 async def create_snapshot(exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin())):
     exam = await _get_exam(db, exam_id)
+
+    # Phase gate: sealing is only allowed from ENTRY_LOCKED.
+    from lazeims_common.enums import ExamPhase
+    if exam.phase != ExamPhase.ENTRY_LOCKED:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "CLOSEOUT_BLOCKED",
+                "blockers": [{"code": "PHASE_NOT_ENTRY_LOCKED", "detail": f"current: {exam.phase.value}"}],
+                "evidence": {},
+            },
+        )
+
     try:
         snap = await closeout.seal_snapshot(db, exam, sealed_by=user.id)
     except closeout.CloseoutBlocked as exc:

@@ -51,6 +51,8 @@ async def _ready_exam(client, h):
     f = await client.post(f"/api/v1/exams/{exam_id}/scopes/finalize", json={
         "school_id": school_id, "exam_subject_id": es, "paper_type": "THEORY1"}, headers=h)
     assert f.status_code == 200 and f.json()["finalized"]
+    # Transition to ENTRY_LOCKED so closeout can seal.
+    await client.post(f"/api/v1/exams/{exam_id}/transitions", json={"target_phase": "ENTRY_LOCKED"}, headers=h)
     return {"exam_id": exam_id, "es": es, "school_id": school_id}
 
 
@@ -77,7 +79,9 @@ async def test_incomplete_closeout_blocked_with_evidence(client):
     s = await client.post(f"/api/v1/exams/{exam_id}/collection-snapshots", headers=h)
     assert s.status_code == 409
     assert s.json()["detail"]["code"] == "CLOSEOUT_BLOCKED"
-    assert any(b["code"] == "SCOPE_NOT_FINALIZED" for b in s.json()["detail"]["blockers"])
+    # Phase gate blocks because exam is not in ENTRY_LOCKED.
+    blockers = s.json()["detail"]["blockers"]
+    assert any(b["code"] in ("SCOPE_NOT_FINALIZED", "PHASE_NOT_ENTRY_LOCKED") for b in blockers)
 
 
 async def test_readiness_run_is_recorded(client):

@@ -70,6 +70,8 @@ async def _ready_exam_with_snapshot(client, h):
     await client.put(f"/api/v1/exams/{exam_id}/attendance", json={"student_id": "S-1", "exam_subject_id": es, "paper_type": "THEORY1", "is_present": True, "source": "INVIGILATOR_ISAL_TRANSCRIPTION"}, headers=h)
     await client.put(f"/api/v1/exams/{exam_id}/marks/students/S-1", json={"exam_subject_id": es, "paper_type": "THEORY1", "mode": "TOTAL_MARKS", "total_marks_obtained": 60}, headers={**h, "Idempotency-Key": uuid.uuid4().hex})
     await client.post(f"/api/v1/exams/{exam_id}/scopes/finalize", json={"school_id": school, "exam_subject_id": es, "paper_type": "THEORY1"}, headers=h)
+    # Transition to ENTRY_LOCKED before sealing (required by phase gate).
+    await client.post(f"/api/v1/exams/{exam_id}/transitions", json={"target_phase": "ENTRY_LOCKED"}, headers=h)
     snap = await _post(client, f"exams/{exam_id}/collection-snapshots", {}, h, expect=200) if False else (await client.post(f"/api/v1/exams/{exam_id}/collection-snapshots", headers=h)).json()
     return exam_id, snap["snapshot_id"]
 

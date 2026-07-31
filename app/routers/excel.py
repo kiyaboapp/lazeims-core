@@ -135,6 +135,22 @@ async def import_errors(import_id: str, db: AsyncSession = Depends(get_session),
 @router.post("/excel/imports/{import_id}/confirm")
 async def confirm_import(import_id: str, db: AsyncSession = Depends(get_session), user: User = Depends(current_user)):
     batch = await _get_batch(db, import_id)
+
+    # Phase gate: Excel import confirm is only allowed during ENTRY_OPEN.
+    workbook = await db.get(ExcelWorkbook, batch.workbook_id)
+    if workbook is not None:
+        exam = await db.get(Exam, workbook.exam_id)
+        if exam is not None:
+            from lazeims_common.enums import ExamPhase
+            if exam.phase != ExamPhase.ENTRY_OPEN:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "code": "PHASE_NOT_OPEN",
+                        "message": f"Excel import confirm is only allowed during ENTRY_OPEN (current: {exam.phase.value}).",
+                    },
+                )
+
     try:
         result = await excel_import.confirm_import(db, batch=batch, confirmed_by=user.id)
     except ValidationError as exc:
