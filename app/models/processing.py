@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..db import Base, TimestampMixin
@@ -30,7 +30,8 @@ class ExamProcessingLink(Base, TimestampMixin):
         PG_UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False, index=True
     )
     # The exam identifier on the ExaMetrics side (its own uuid7 string).
-    backend_exam_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # Nullable: will be auto-provisioned in Phase 2 if not provided upfront.
+    backend_exam_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # The purchased per-exam key (X-API-Key). Kept out of Exam.settings so it is
     # never leaked through normal exam serialization.
     api_key: Mapped[str] = mapped_column(String(120), nullable=False)
@@ -38,3 +39,9 @@ class ExamProcessingLink(Base, TimestampMixin):
     last_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_status: Mapped[str | None] = mapped_column(String(40), nullable=True)
     configured_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    # Cached capabilities response from GET /integration/me.
+    capabilities_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    capabilities_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Verified tenant name from the identity response.
+    tenant_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
