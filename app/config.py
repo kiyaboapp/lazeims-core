@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # Optional prebuilt wheelhouse for fully-offline first-run installs. When
     # set and present, its wheels are copied into the bundle.
     station_wheelhouse_dir: str = ""
+    # Optional bundled Python runtime (a venv-capable build, e.g.
+    # python-build-standalone) copied into the bundle as runtime/ for a true
+    # zero-install double-click on machines without Python.
+    station_runtime_dir: str = ""
 
     # ── Credential delivery (station admin login) ────────────────────────────
     # When SMTP is configured, a station's default admin login is emailed to the

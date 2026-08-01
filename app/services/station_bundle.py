@@ -94,9 +94,10 @@ PORT="${STATION_PORT:-8080}"
 ENV_DIR="${STATION_ENV_DIR:-$HOME/.lazeims-station/env}"
 log "Shared env : $ENV_DIR"
 
-# 1) find Python 3.11+
+# 1) find Python 3.11+ (prefer a bundled zero-install runtime if shipped)
 PY=""
-for cand in "${PYTHON:-}" python3 python; do
+if [ -x "./runtime/bin/python3" ]; then PY="./runtime/bin/python3"; fi
+for cand in "$PY" "${PYTHON:-}" python3 python; do
   [ -n "$cand" ] || continue
   command -v "$cand" >/dev/null 2>&1 && { PY="$cand"; break; }
 done
@@ -176,8 +177,9 @@ call :log "== LAZEIMS Station =="
 call :log "Bundle : %BUNDLE%"
 call :log "Shared env : %ENV_DIR%"
 
-REM 1) find Python (ignore the Windows Store stub)
+REM 1) find Python (prefer a bundled zero-install runtime, then system Python)
 set PY=
+if exist "runtime\\python.exe" set PY=runtime\\python.exe
 for %%P in (py.exe python.exe) do (
   if "!PY!"=="" ( where %%P >nul 2>nul && set PY=%%P )
 )
@@ -309,6 +311,12 @@ def build_bundle_zip(*, station_code: str, exam_id: str, package_id: str, packag
             wh = _resolve(settings.station_wheelhouse_dir)
             if wh.is_dir():
                 _add_tree(zf, wh, f"{root}/wheelhouse")
+
+        # optional bundled Python runtime (true zero-install)
+        if settings.station_runtime_dir:
+            rt = _resolve(settings.station_runtime_dir)
+            if rt.is_dir():
+                _add_tree(zf, rt, f"{root}/runtime")
 
         # the signed package, placed where the station auto-imports it on boot
         zf.writestr(
