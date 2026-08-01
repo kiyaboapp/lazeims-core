@@ -53,6 +53,27 @@ class Settings(BaseSettings):
     # registration. Empty disables webhook registration.
     central_public_base_url: str = ""
 
+    # ── Complete Station Bundle assembly ─────────────────────────────────────
+    # Filesystem locations of the station app and the shared contract package,
+    # vendored into the downloadable one-click bundle. Defaults assume the repos
+    # sit side-by-side (as they do in this workspace).
+    station_app_dir: str = "../lazeims-station"
+    lazeims_common_dir: str = "../lazeims-common"
+    # Optional prebuilt wheelhouse for fully-offline first-run installs. When
+    # set and present, its wheels are copied into the bundle.
+    station_wheelhouse_dir: str = ""
+
+    # ── Credential delivery (station admin login) ────────────────────────────
+    # When SMTP is configured, a station's default admin login is emailed to the
+    # station super-admin on package generation. Empty host => in-app only (the
+    # secret is still shown once in the console so it can be handed over).
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True
+    notify_from_email: str = "no-reply@lazeims.local"
+
     @property
     def processing_enabled(self) -> bool:
         return bool(self.backend_sis_base_url.strip())

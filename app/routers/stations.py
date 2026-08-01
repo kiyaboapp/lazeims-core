@@ -182,6 +182,17 @@ async def generate_package(
     db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager),
 ):
     st = await _get_station(db, exam_id, station_id)
+
+    # Ensure the station ships with a default admin login so the receiving
+    # super-admin ("chief") can sign in immediately. Provision BEFORE building
+    # the seed so the credential hash is baked into the package.
+    from ..services.station_admin import deliver_station_admin, ensure_default_station_admin
+
+    admin_cred = await ensure_default_station_admin(
+        db, exam_id=exam_id, station=st, actor=user,
+        username=payload.admin_username, password=payload.admin_password,
+    )
+
     pkg = await generate_station_package(
         db, station=st, schools=payload.schools,
         subject_codes=payload.subjects, papers=[p.value for p in payload.papers],
@@ -190,7 +201,16 @@ async def generate_package(
     await notif.record(db, action="PACKAGE_ISSUED", entity_type="station_package", entity_id=pkg.package_id,
                        actor_id=user.id, exam_id=exam_id,
                        after={"station_id": station_id, "version": pkg.package_version})
-    return PackageOut.model_validate(pkg)
+
+    out = PackageOut.model_validate(pkg)
+    if admin_cred is not None:
+        delivery = await deliver_station_admin(
+            db, exam_id=exam_id, station=st, actor=user, credential=admin_cred
+        )
+        out.station_admin_username = admin_cred["username"]
+        out.station_admin_password = admin_cred["password"]
+        out.station_admin_delivery = delivery["channel"]
+    return out
 
 
 @router.get("/{exam_id}/stations/{station_id}/packages", response_model=list[PackageOut])
@@ -213,6 +233,41 @@ async def download_package(
         raise HTTPException(410, "package has been revoked")
     # The bundle content: signed manifest + scope-only seed.
     return pkg.manifest
+
+
+@router.get("/{exam_id}/stations/{station_id}/packages/{package_id}/bundle")
+async def download_bundle(
+    exam_id: uuid.UUID, station_id: int, package_id: str,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager),
+):
+    """Complete, runnable station bundle (.zip): the offline station app +
+    vendored deps + one-click launcher, with this package pre-embedded so it
+    auto-imports on first boot. This is what an operator downloads and runs."""
+    from fastapi.responses import Response
+
+    from ..services.station_bundle import build_bundle_zip
+
+    st = await _get_station(db, exam_id, station_id)
+    pkg = await db.get(StationPackage, package_id)
+    if pkg is None or pkg.station_id != station_id:
+        raise HTTPException(404, "package not found")
+    if pkg.revoked_at is not None:
+        raise HTTPException(410, "package has been revoked")
+    try:
+        data = build_bundle_zip(
+            station_code=st.station_code,
+            exam_id=str(exam_id),
+            package_id=package_id,
+            package_bundle=pkg.manifest,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(500, f"bundle sources unavailable: {exc}")
+    filename = f"lazeims-station-{st.station_code}-{package_id}.zip"
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/{exam_id}/stations/{station_id}/packages/{package_id}/revoke")

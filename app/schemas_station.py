@@ -57,6 +57,10 @@ class PackageGenerateIn(BaseModel):
     schools: list[str] = Field(min_length=1)      # centre numbers
     subjects: list[str] = Field(min_length=1)      # subject codes
     papers: list[PaperType] = Field(min_length=1)
+    # Optional operator overrides for the default station-admin login. When
+    # omitted, username defaults to the station code and a password is generated.
+    admin_username: str | None = Field(default=None, max_length=60)
+    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class PackageOut(BaseModel):
@@ -69,3 +73,8 @@ class PackageOut(BaseModel):
     configuration_hash: str
     assigned_scope: dict
     revoked_at: object | None = None
+    # One-time default station-admin login, present only in the response of the
+    # generate call that created it. Never stored, never re-shown.
+    station_admin_username: str | None = None
+    station_admin_password: str | None = None
+    station_admin_delivery: str | None = None  # EMAIL | IN_APP
