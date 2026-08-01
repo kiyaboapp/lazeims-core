@@ -58,7 +58,10 @@ def _should_skip(rel_parts: tuple[str, ...], name: str) -> bool:
 
 
 def _add_tree(zf: zipfile.ZipFile, src_dir: Path, arc_prefix: str) -> None:
-    """Recursively add ``src_dir`` into the zip under ``arc_prefix/``."""
+    """Recursively add ``src_dir`` into the zip under ``arc_prefix/``, preserving
+    file permissions (so a bundled runtime's ``bin/python3`` stays executable)."""
+    import os as _os
+
     src_dir = src_dir.resolve()
     for path in sorted(src_dir.rglob("*")):
         if not path.is_file():
@@ -66,7 +69,10 @@ def _add_tree(zf: zipfile.ZipFile, src_dir: Path, arc_prefix: str) -> None:
         rel = path.relative_to(src_dir)
         if _should_skip(rel.parts[:-1], path.name):
             continue
-        zf.writestr(f"{arc_prefix}/{rel.as_posix()}", path.read_bytes())
+        zi = zipfile.ZipInfo(f"{arc_prefix}/{rel.as_posix()}")
+        zi.external_attr = (_os.stat(path).st_mode & 0xFFFF) << 16
+        zi.compress_type = zipfile.ZIP_DEFLATED
+        zf.writestr(zi, path.read_bytes())
 
 
 # ── launcher scripts (bundle-specific: no sibling-repo assumption) ───────────
