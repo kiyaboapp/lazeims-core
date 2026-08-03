@@ -30,7 +30,7 @@ from lazeims_common.reconcile import (
     scope_digest,
 )
 
-from ..models.assignments import FinalizedScope, ScopeWriteAssignment, Station
+from ..models.assignments import FinalizedScope, Station
 from ..models.collection import CollectionExportFile, CollectionReadinessRun, CollectionSnapshot
 from ..models.exam import Exam, ExamStudent, ExamStudentSubject, ExamSubject
 from ..models.marks import ExamIncident, ItemMark, TotalMark
@@ -83,19 +83,6 @@ async def compute_readiness(db: AsyncSession, exam: Exam) -> Readiness:
 
     expected = await _expected_scopes(db, exam)
     evidence["expected_scope_count"] = len(expected)
-
-    # writer assignments complete
-    wa_rows = (
-        await db.execute(select(
-            ScopeWriteAssignment.school_id, ScopeWriteAssignment.exam_subject_id, ScopeWriteAssignment.paper_type)
-            .where(ScopeWriteAssignment.exam_id == exam.id))
-    ).all()
-    assigned = {(r[0], r[1], r[2].value if hasattr(r[2], "value") else r[2]) for r in wa_rows}
-    missing_writer = expected - assigned
-    if missing_writer:
-        blockers.append({"code": "WRITER_ASSIGNMENTS_INCOMPLETE",
-                         "message": f"{len(missing_writer)} scope(s) have no writer assignment.",
-                         "evidence": {"missing_count": len(missing_writer)}})
 
     # finalized scopes complete
     fin_rows = (

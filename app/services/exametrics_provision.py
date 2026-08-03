@@ -21,9 +21,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
-from ..models.exam import Exam
+from ..models.exam import Exam, ExamSubject
 from ..models.processing import ExamProcessingLink
-from ..models.registry import Board, ExamLevel, User
+from ..models.registry import Board, ExamLevel, Subject, User
 from . import backend_sis, notifications
 from .backend_sis import BackendSisError
 
@@ -69,7 +69,7 @@ async def _provision_payload(db: AsyncSession, exam: Exam, user: User) -> dict:
     board = await db.get(Board, exam.board_id) if exam.board_id else None
     settings = get_settings()
     zone = settings.zone_name.strip()
-    return {
+    payload = {
         "external_exam_id": str(exam.id),
         "exam_name": exam.name,
         "exam_level": (level.name if level else "").upper(),
@@ -80,12 +80,66 @@ async def _provision_payload(db: AsyncSession, exam: Exam, user: User) -> dict:
         "partner_label": (zone or "LAZEIMS")[:60],
         "requested_by": _requester_payload(user),
     }
+    # Include callback_url for webhook notifications (processing state changes)
+    if settings.central_public_base_url:
+        payload["callback_url"] = (
+            settings.central_public_base_url.strip().rstrip("/") + "/webhooks/exametrics"
+        )
+    return payload
 
 
 async def _get_link(db: AsyncSession, exam_id: uuid.UUID) -> ExamProcessingLink | None:
     return (
         await db.execute(select(ExamProcessingLink).where(ExamProcessingLink.exam_id == exam_id))
     ).scalar_one_or_none()
+
+
+async def build_subjects_payload(db: AsyncSession, exam: Exam) -> list[dict]:
+    """Build the subjects list for PUT /integration/exams from exam_subjects.
+
+    Each subject carries its paper configuration (has_practical, has_theory_2)
+    and the maximum marks per paper so ExaMetrics can validate marks and compute
+    grades/GPA correctly.
+    """
+    rows = (
+        await db.execute(
+            select(
+                Subject.code,
+                Subject.name,
+                Subject.is_primary,
+                Subject.is_olevel,
+                Subject.is_alevel,
+                ExamSubject.has_theory2,
+                ExamSubject.has_practical,
+                ExamSubject.total_marks_theory1,
+                ExamSubject.total_marks_theory2,
+                ExamSubject.total_marks_practical,
+            )
+            .join(ExamSubject, ExamSubject.subject_id == Subject.id)
+            .where(ExamSubject.exam_id == exam.id)
+        )
+    ).all()
+
+    subjects = []
+    for (
+        code, name, is_primary, is_olevel, is_alevel,
+        has_theory2, has_practical,
+        max_t1, max_t2, max_prac,
+    ) in rows:
+        subjects.append({
+            "subject_code": code,
+            "subject_name": name,
+            "subject_short": code,
+            "has_theory_2": bool(has_theory2),
+            "has_practical": bool(has_practical),
+            "is_primary": bool(is_primary),
+            "is_olevel": bool(is_olevel),
+            "is_alevel": bool(is_alevel),
+            "theory_max": float(max_t1) if max_t1 else 100.0,
+            "theory_2_max": float(max_t2) if max_t2 else None,
+            "practical_max": float(max_prac) if max_prac else None,
+        })
+    return subjects
 
 
 async def ensure_access_key(
@@ -172,4 +226,26 @@ async def ensure_access_key(
             "rotated": bool(existing is not None),
         },
     )
+
+    # Sync the exam definition (subjects + max marks) to ExaMetrics immediately
+    # after the key is stored. Best-effort: a failure here is logged but must
+    # never prevent the key from being usable for collection.
+    level = await db.get(ExamLevel, exam.level_id)
+    level_name = (level.name if level else "").upper()
+    settings = get_settings()
+    try:
+        subjects = await build_subjects_payload(db, exam)
+        filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
+        await backend_sis.upsert_exam_definition(
+            api_key,
+            external_ref=str(exam.id),
+            name=exam.name,
+            level=level_name,
+            zone_name=settings.zone_name.strip() or None,
+            filling_mode=filling_mode,
+            subjects=subjects,
+        )
+    except Exception:  # noqa: BLE001 — definition sync must never block key issuance
+        pass
+
     return link, None

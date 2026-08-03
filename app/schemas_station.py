@@ -29,13 +29,6 @@ class StationOut(BaseModel):
     software_version: str | None
 
 
-class StationKeyOut(BaseModel):
-    """Returned ONCE at station creation: the plaintext machine sync key."""
-    station_id: int
-    station_code: str
-    sync_key: str  # shown once; only the hash is stored
-
-
 class CredentialIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     exam_role_assignment_id: int

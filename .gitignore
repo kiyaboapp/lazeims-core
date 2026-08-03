@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+# Ed25519 signing keys — NEVER commit
+*.pem
+package_signing*
+signing_key*

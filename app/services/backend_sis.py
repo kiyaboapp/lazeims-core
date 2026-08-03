@@ -182,6 +182,45 @@ async def upsert_exam(api_key: str, payload: dict) -> dict:
         return _unwrap(resp) or {}
 
 
+async def upsert_exam_definition(
+    api_key: str,
+    *,
+    external_ref: str,
+    name: str,
+    level: str,
+    zone_name: str | None,
+    filling_mode: str,
+    subjects: list[dict],
+) -> dict:
+    """Push the exam definition (name, level, subjects with max marks) to
+    ExaMetrics via PUT /integration/exams.
+
+    ExaMetrics uses ``theory_max`` / ``theory_2_max`` / ``practical_max`` per
+    subject to validate marks and compute grades/GPA. This call must be made:
+      - after a key is issued (provisioning or rotation);
+      - before a collection is submitted for processing;
+      - whenever subjects are patched or re-seeded.
+
+    Idempotent: an identical body returns ``state: "UNCHANGED"`` with no DB
+    write on the ExaMetrics side.
+    """
+    payload = {
+        "external_ref": external_ref,
+        "name": name,
+        "level": level,
+        "zone_name": zone_name or None,
+        "filling_mode": filling_mode,  # TOTAL_MARKS | ITEM_LEVEL
+        "subjects": subjects,
+    }
+    async with _client(api_key) as client:
+        resp = await client.put(
+            "/integration/exams",
+            json=payload,
+            headers={"Idempotency-Key": _idempotency_key()},
+        )
+        return _unwrap(resp) or {}
+
+
 async def get_exam(api_key: str, exam_ref: str) -> dict:
     """GET /integration/exams/{ref} - retrieve exam details."""
     async with _client(api_key) as client:

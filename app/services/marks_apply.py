@@ -102,22 +102,36 @@ async def apply_student_paper_marks(
 
     now = datetime.now(timezone.utc)
 
-    # Persist with replace semantics for this student-paper.
+    # Persist with upsert semantics (ON CONFLICT DO UPDATE) for this student-paper.
+    # Plain DELETE+INSERT causes UniqueViolationError under concurrent debounce
+    # flushes from the same browser session.
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
     if mode == FillingMode.TOTAL_MARKS:
-        await db.execute(
-            delete(TotalMark).where(
-                TotalMark.exam_student_subject_id == ess_id,
-                TotalMark.paper_type == paper_type,
-            )
-        )
-        if is_present:
-            db.add(TotalMark(
+        if is_present and total_marks_obtained is not None:
+            stmt = pg_insert(TotalMark).values(
                 exam_student_subject_id=ess_id,
                 paper_type=paper_type,
                 total_marks_obtained=Decimal(str(total_marks_obtained)),
                 entered_by=actor_id,
                 entered_at=now,
-            ))
+            ).on_conflict_do_update(
+                constraint="uq_total_marks_ess_paper",
+                set_=dict(
+                    total_marks_obtained=Decimal(str(total_marks_obtained)),
+                    entered_by=actor_id,
+                    entered_at=now,
+                )
+            )
+            await db.execute(stmt)
+        else:
+            # Absent or null mark — clear any existing record
+            await db.execute(
+                delete(TotalMark).where(
+                    TotalMark.exam_student_subject_id == ess_id,
+                    TotalMark.paper_type == paper_type,
+                )
+            )
     else:  # ITEM_LEVEL
         # Clear existing item marks for this paper's questions.
         qids = (

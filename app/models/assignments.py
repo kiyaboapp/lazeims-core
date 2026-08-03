@@ -113,6 +113,7 @@ class StationCredential(Base, TimestampMixin):
     pin_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)  # DATA_ENTERER only
     initials: Mapped[str | None] = mapped_column(String(10), nullable=True)  # DATA_ENTERER only
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)  # station EXAM_ADMIN only
+    admin_username: Mapped[str | None] = mapped_column(String(60), nullable=True)  # station EXAM_ADMIN username
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

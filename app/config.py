@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     # zero-install double-click on machines without Python.
     station_runtime_dir: str = ""
 
+    # ── Ed25519 package signing ──────────────────────────────────────────────
+    # Path to the PEM-encoded Ed25519 private key for signing station packages.
+    # When empty, a deterministic dev/test key is used (ONLY acceptable in
+    # development). Production MUST set this to a real key path.
+    package_signing_private_key_path: str = ""
+
     # ── Credential delivery (station admin login) ────────────────────────────
     # When SMTP is configured, a station's default admin login is emailed to the
     # station super-admin on package generation. Empty host => in-app only (the

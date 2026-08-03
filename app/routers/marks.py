@@ -2,10 +2,13 @@
 
 Every write:
   1. requires the exam to be in ENTRY_OPEN;
-  2. enforces ScopeWriteAssignment == ONLINE BEFORE content validation;
-  3. rejects writes to an already-finalized scope;
-  4. validates content through the shared lazeims_common rules;
-  5. (marks) is idempotent via the ``Idempotency-Key`` header.
+  2. rejects writes to an already-finalized scope;
+  3. validates content through the shared lazeims_common rules;
+  4. (marks) is idempotent via the ``Idempotency-Key`` header.
+
+ScopeWriteAssignment is NOT checked here — the online channel is open to any
+assigned data enterer. Station and Excel writes enforce their own channel checks
+at write time in station_sync.py / excel_import.py.
 """
 
 from __future__ import annotations
@@ -52,7 +55,6 @@ from ..services.attendance import upsert_attendance
 from ..services.finalize import evaluate_scope, finalize_scope
 from ..services.marks_apply import apply_student_paper_marks
 from ..services.scope_assignment import (
-    enforce_writer_mode,
     is_scope_finalized,
     resolve_student_scope,
 )
@@ -99,8 +101,16 @@ async def _get_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
 
 
 def _require_entry_open(exam: Exam) -> None:
-    if exam.phase != ExamPhase.ENTRY_OPEN:
-        raise HTTPException(409, f"Entry is not open (phase {exam.phase.value}).")
+    """Block marks/attendance only when the exam is past the collection phases.
+
+    REGISTRATION and ENTRY_OPEN are both valid for data entry. The phase model
+    is advisory for workflow navigation; the backend must not gate data entry
+    so strictly that operators cannot enter marks at all.
+    Blocked phases: ENTRY_LOCKED, PROCESSING, RESULTS_PUBLISHED.
+    """
+    blocked = {ExamPhase.ENTRY_LOCKED, ExamPhase.PROCESSING, ExamPhase.RESULTS_PUBLISHED}
+    if exam.phase in blocked:
+        raise HTTPException(409, f"Entry is locked (phase {exam.phase.value}).")
 
 
 # ---------------- attendance ----------------
@@ -117,11 +127,6 @@ async def transcribe_attendance(
     try:
         scope = await resolve_student_scope(
             db, exam_id=exam_id, student_id=payload.student_id, exam_subject_id=payload.exam_subject_id
-        )
-        await enforce_writer_mode(
-            db, exam_id=exam_id, school_id=scope.student.school_id,
-            exam_subject_id=payload.exam_subject_id, paper_type=payload.paper_type,
-            expected_mode=WriterMode.ONLINE,
         )
     except ValidationError as exc:
         raise _vhttp(exc)
@@ -227,10 +232,6 @@ async def update_incident_status(
 async def _apply_one(db, exam_id, user, student_id, sm) -> dict:
     scope = await resolve_student_scope(
         db, exam_id=exam_id, student_id=student_id, exam_subject_id=sm.exam_subject_id
-    )
-    await enforce_writer_mode(
-        db, exam_id=exam_id, school_id=scope.student.school_id,
-        exam_subject_id=sm.exam_subject_id, paper_type=sm.paper_type, expected_mode=WriterMode.ONLINE,
     )
     if await is_scope_finalized(db, exam_id=exam_id, school_id=scope.student.school_id,
                                 exam_subject_id=sm.exam_subject_id, paper_type=sm.paper_type):
@@ -354,7 +355,7 @@ async def scope_roster(
             total = None if tm is None else float(tm)
         out.append({
             "student_id": student.student_id,
-            "first_name": student.first_name, "surname": student.surname,
+            "full_name": student.full_name,
             "attendance": present, "has_marks": has_marks, "total": total,
         })
     return {"mode": mode, "students": out}
@@ -378,14 +379,6 @@ async def finalize(
     exam = await _get_exam(db, exam_id)
     _require_entry_open(exam)
     es = await _resolve_scope_subject(db, exam_id, payload.exam_subject_id)
-    try:
-        await enforce_writer_mode(
-            db, exam_id=exam_id, school_id=payload.school_id,
-            exam_subject_id=payload.exam_subject_id, paper_type=payload.paper_type,
-            expected_mode=WriterMode.ONLINE,
-        )
-    except ValidationError as exc:
-        raise _vhttp(exc)
     finalized, result = await finalize_scope(
         db, exam=exam, school_id=payload.school_id, exam_subject=es,
         paper_type=payload.paper_type, writer_mode=WriterMode.ONLINE, finalized_by=user.id,

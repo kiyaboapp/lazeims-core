@@ -13,6 +13,7 @@ import uuid
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +38,7 @@ from ..models.exam import (
     ExamStudentSubject,
     ExamSubject,
 )
-from ..models.registry import User
+from ..models.registry import User, ExamLevel
 from ..models.scoring import Question, QuestionGroup, QuestionTopic
 from ..schemas_exam import (
     BulkExamSchoolIn,
@@ -61,9 +62,10 @@ from ..schemas_exam import (
 )
 from ..schemas_registry import PaginatedResponse
 from ..services import notifications
+from ..services.backend_sis import BackendSisError
 from ..services.collection_progress import collection_progress
 from ..services.exam_config import seal_configuration_version, validate_subject_scoring
-from ..services.exametrics_provision import ensure_access_key
+from ..services.exametrics_provision import build_subjects_payload, ensure_access_key
 from ..services.exam_phase import (
     assert_transition_allowed,
     compute_entry_open_readiness,
@@ -139,15 +141,29 @@ async def create_exam(
         level_name = level.name.upper()
         if level_name in ("SFNA", "PSLE"):
             filter_col = Subject.is_primary
-        elif level_name in ("FTNA", "CSEE"):
+            extra_filter = None
+        elif level_name == "CSEE":
+            # CSEE: academic O-level subjects only (codes 011–099).
+            # Vocational/trade subjects (200+, 800-series, L0x, A0x etc.) are
+            # O-level too but belong to FTNA vocational tracks, not CSEE.
             filter_col = Subject.is_olevel
+            extra_filter = Subject.code.regexp_match(r'^0[0-9]{2}$')
+        elif level_name == "FTNA":
+            # FTNA: all O-level subjects including vocational trades
+            filter_col = Subject.is_olevel
+            extra_filter = None
         elif level_name == "ACSEE":
             filter_col = Subject.is_alevel
+            extra_filter = None
         else:
             filter_col = None
+            extra_filter = None
 
         if filter_col is not None:
-            subjects = (await db.execute(select(Subject).where(filter_col == True))).scalars().all()
+            stmt = select(Subject).where(filter_col == True)
+            if extra_filter is not None:
+                stmt = stmt.where(extra_filter)
+            subjects = (await db.execute(stmt)).scalars().all()
             for subj in subjects:
                 db.add(ExamSubject(
                     exam_id=exam.id,
@@ -260,6 +276,72 @@ async def get_my_exam_access(
             "view_results": True,
         },
     }
+
+
+# ---- entry-scopes (for data entry navigation) ----
+
+class EntryScopeOut(BaseModel):
+    region_id: int | None
+    region_name: str | None
+    council_id: int | None
+    council_name: str | None
+    school_id: int
+    school_name: str
+    centre_number: str
+
+
+@router.get("/{exam_id}/entry-scopes")
+async def get_entry_scopes(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    """Return schools with their region/council geography for the data entry
+    navigation. This is used for the cascading Region -> Council -> School
+    selector in the data entry flow.
+
+    Returns all enrolled schools enriched with their geographical hierarchy.
+    The client can filter further based on the user's assignment scopes
+    (DataEntererScope) if needed.
+
+    Returns a flat list for simplicity; the client builds the hierarchy.
+    """
+    from ..models.registry import Region, Council, School
+
+    rows = (
+        await db.execute(
+            select(
+                Region.id.label("region_id"),
+                Region.name.label("region_name"),
+                Council.id.label("council_id"),
+                Council.name.label("council_name"),
+                School.id.label("school_id"),
+                School.name.label("school_name"),
+                School.centre_number,
+            )
+            .select_from(ExamSchool)
+            .join(School, School.id == ExamSchool.school_id)
+            .outerjoin(Region, Region.id == School.region_id)
+            .outerjoin(Council, Council.id == School.council_id)
+            .where(ExamSchool.exam_id == exam_id)
+            .order_by(Region.name, Council.name, School.centre_number)
+        )
+    ).all()
+
+    scopes = []
+    for r in rows:
+        scopes.append(
+            EntryScopeOut(
+                region_id=r.region_id,
+                region_name=r.region_name,
+                council_id=r.council_id,
+                council_name=r.council_name,
+                school_id=r.school_id,
+                school_name=r.school_name,
+                centre_number=r.centre_number,
+            )
+        )
+    return scopes
 
 
 # ---- filling progress ----
@@ -538,9 +620,19 @@ async def detach_school(
 # ---- subjects ----
 
 @router.get("/{exam_id}/subjects", response_model=list[ExamSubjectOut])
-async def list_exam_subjects(exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), _: User = Depends(current_user)):
+async def list_exam_subjects(
+    exam_id: uuid.UUID,
+    school_id: int | None = Query(None, description="When set, return only subjects that have registered students at this school."),
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(current_user),
+):
     """Subjects offered in this exam, enriched with registry code/name and the
-    number of candidates registered for each."""
+    number of candidates registered for each.
+
+    Pass ``school_id`` to get only subjects that have at least one registered
+    student at that school — this is what the data entry scope selector needs
+    so enterers never see subjects with no candidates to enter marks for.
+    """
     from ..models.registry import Subject as _Subject
 
     counts = dict(
@@ -548,19 +640,30 @@ async def list_exam_subjects(exam_id: uuid.UUID, db: AsyncSession = Depends(get_
             await db.execute(
                 select(ExamStudentSubject.exam_subject_id, func.count())
                 .join(ExamSubject, ExamSubject.id == ExamStudentSubject.exam_subject_id)
+                .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
                 .where(ExamSubject.exam_id == exam_id)
+                .where(
+                    ExamStudent.school_id == school_id
+                    if school_id is not None
+                    else ExamStudent.exam_id == exam_id
+                )
                 .group_by(ExamStudentSubject.exam_subject_id)
             )
         ).all()
     )
 
+    rows_query = (
+        select(ExamSubject, _Subject.code, _Subject.name)
+        .join(_Subject, _Subject.id == ExamSubject.subject_id)
+        .where(ExamSubject.exam_id == exam_id)
+    )
+
+    # When filtering by school, only return subjects that have students there
+    if school_id is not None:
+        rows_query = rows_query.where(ExamSubject.id.in_(counts.keys()))
+
     rows = (
-        await db.execute(
-            select(ExamSubject, _Subject.code, _Subject.name)
-            .join(_Subject, _Subject.id == ExamSubject.subject_id)
-            .where(ExamSubject.exam_id == exam_id)
-            .order_by(_Subject.code)
-        )
+        await db.execute(rows_query.order_by(_Subject.code))
     ).all()
 
     out: list[ExamSubjectOut] = []
@@ -641,6 +744,34 @@ async def seed_default_subjects(
         )
         added += 1
     await db.flush()
+
+    # Sync the exam definition (subjects + max marks) to ExaMetrics after
+    # seeding. Best-effort: same error handling as patch_exam_subject.
+    try:
+        level = await db.get(_ExamLevel, exam.level_id)
+        level_name = (level.name or "").upper() if level else ""
+        settings = get_settings()
+        subjects = await build_subjects_payload(db, exam)
+        filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
+        from ..models.processing import ExamProcessingLink
+        link = (
+            await db.execute(
+                select(ExamProcessingLink).where(ExamProcessingLink.exam_id == exam.id)
+            )
+        ).scalar_one_or_none()
+        if link and link.api_key:
+            await backend_sis.upsert_exam_definition(
+                link.api_key,
+                external_ref=str(exam.id),
+                name=exam.name,
+                level=level_name,
+                zone_name=settings.zone_name.strip() or None,
+                filling_mode=filling_mode,
+                subjects=subjects,
+            )
+    except Exception:  # noqa: BLE001 — best effort, don't fail the POST
+        pass
+
     return {"level": level_name, "added": added, "skipped": len(existing), "matched": len(candidates)}
 
 
@@ -683,6 +814,36 @@ async def patch_exam_subject(
         raise HTTPException(422, "Theory 1 maximum marks must be greater than zero.")
 
     await db.flush()
+
+    # Sync the exam definition (subjects + max marks) to ExaMetrics after any
+    # subject configuration change. Best-effort: ExaMetrics may reject if
+    # processing has started; we log but don't fail the PATCH request.
+    try:
+        level = await db.get(ExamLevel, exam.level_id)
+        level_name = (level.name if level else "").upper()
+        settings = get_settings()
+        subjects = await build_subjects_payload(db, exam)
+        filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
+        # Need to get the link's api_key - pull the processing link
+        from ..models.processing import ExamProcessingLink
+        link = (
+            await db.execute(
+                select(ExamProcessingLink).where(ExamProcessingLink.exam_id == exam.id)
+            )
+        ).scalar_one_or_none()
+        if link and link.api_key:
+            await backend_sis.upsert_exam_definition(
+                link.api_key,
+                external_ref=str(exam.id),
+                name=exam.name,
+                level=level_name,
+                zone_name=settings.zone_name.strip() or None,
+                filling_mode=filling_mode,
+                subjects=subjects,
+            )
+    except Exception:  # noqa: BLE001 — best effort, don't fail the PATCH
+        pass
+
     return ExamSubjectOut.model_validate(row)
 
 

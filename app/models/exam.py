@@ -14,6 +14,7 @@ from datetime import date
 
 from sqlalchemy import (
     Boolean,
+    Computed,
     Date,
     Enum as SAEnum,
     ForeignKey,
@@ -109,6 +110,13 @@ class ExamStudent(Base, TimestampMixin):
     middle_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
     surname: Mapped[str] = mapped_column(String(80), nullable=False)
     sex: Mapped[Sex] = mapped_column(_enum(Sex, "sex"), nullable=False)
+    full_name: Mapped[str] = mapped_column(
+        String(242),
+        Computed(
+            "UPPER(first_name) || ' ' || COALESCE(UPPER(middle_name) || ' ', '') || UPPER(surname)",
+            persisted=True,
+        ),
+    )
 
 
 class ExamStudentSubject(Base, TimestampMixin):

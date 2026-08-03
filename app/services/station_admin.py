@@ -60,6 +60,15 @@ async def ensure_default_station_admin(
     shows it on the admin sign-in.
     """
     if await _existing_admin_credential(db, station.id) is not None:
+        # Credential already exists. If the operator explicitly provided a
+        # password, update it so the new package carries the new hash.
+        if password and password.strip():
+            existing = await _existing_admin_credential(db, station.id)
+            from ..security import hash_secret as _hash
+            existing.password_hash = _hash(password.strip())
+            if username and username.strip():
+                existing.admin_username = username.strip()
+            await db.flush()
         return None
 
     login_username = (username or station.station_code).strip() or station.station_code
@@ -88,7 +97,8 @@ async def ensure_default_station_admin(
     cred = StationCredential(
         exam_role_assignment_id=assignment.id, station_id=station.id,
         password_hash=hash_secret(login_password),
-        initials=login_username[:10],  # carries the admin username into the package/station
+        admin_username=login_username,
+        initials=login_username[:10],  # backward compat: also set initials
         issued_at=datetime.now(timezone.utc),
     )
     db.add(cred)

@@ -59,6 +59,7 @@ from .scoring import (
     QuestionTopic,
 )
 from .station import (
+    StationMachineCredential,
     StationPackage,
     StationReconciliation,
     StationSyncLog,
@@ -87,5 +88,6 @@ __all__ = [
     "Station", "ExamRoleAssignment", "DataEntererScope", "ScopeWriteAssignment",
     "StationCredential", "FinalizedScope", "ScopeRevision",
     # station domain
-    "StationPackage", "SyncEventReceipt", "StationSyncLog", "StationReconciliation",
+    "StationPackage", "StationMachineCredential", "SyncEventReceipt",
+    "StationSyncLog", "StationReconciliation",
 ]

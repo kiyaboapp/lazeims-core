@@ -112,12 +112,13 @@ async def test_manifest_is_signed_and_verifiable(client):
         f"/api/v1/exams/{exam_id}/stations/{st['station_id']}/packages/{pkg['package_id']}/download", headers=h
     )).json()
     manifest = bundle["manifest"]
-    signature = manifest.pop("signature")
-    from app.services.station_package import verify_manifest_signature
-    assert verify_manifest_signature(manifest, signature)
+    signature = bundle["signature"]
+    # Ed25519 signing
+    from lazeims_common.signing import verify_package_signature
+    assert verify_package_signature(manifest, signature)
     # tampering breaks verification
     manifest["station_code"] = "TAMPERED"
-    assert not verify_manifest_signature(manifest, signature)
+    assert not verify_package_signature(manifest, signature)
 
 
 # ---------- machine key + credentials shown once ----------

@@ -47,6 +47,30 @@ class StationPackage(Base, TimestampMixin):
     manifest: Mapped[dict] = mapped_column(JSONB, nullable=False)
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    supersedes_package_id: Mapped[str | None] = mapped_column(
+        String(80), ForeignKey("station_packages.package_id"), nullable=True
+    )
+
+
+class StationMachineCredential(Base, TimestampMixin):
+    """Per-package machine credential for Station→Central sync authentication.
+
+    Central stores ONLY the Argon2id hash. The plaintext is carried once inside
+    the generated package ZIP and never persisted centrally.
+    """
+
+    __tablename__ = "station_machine_credentials"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    credential_id: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
+    package_id: Mapped[str] = mapped_column(ForeignKey("station_packages.package_id"), nullable=False, index=True)
+    station_id: Mapped[int] = mapped_column(ForeignKey("stations.id"), nullable=False, index=True)
+    secret_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    algorithm: Mapped[str] = mapped_column(String(20), nullable=False, default="argon2id")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SyncEventReceipt(Base, TimestampMixin):

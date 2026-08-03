@@ -35,11 +35,9 @@ from ..schemas_station import (
     PackageGenerateIn,
     PackageOut,
     StationIn,
-    StationKeyOut,
     StationOut,
 )
 from ..security import hash_secret
-from ..services.station_package import generate_station_package
 
 router = APIRouter(prefix="/exams", tags=["stations"])
 
@@ -75,25 +73,24 @@ async def _get_station(db: AsyncSession, exam_id: uuid.UUID, station_id: int) ->
     return st
 
 
-@router.post("/{exam_id}/stations", response_model=StationKeyOut, status_code=201)
+@router.post("/{exam_id}/stations", response_model=StationOut, status_code=201)
 async def create_station(
     exam_id: uuid.UUID, payload: StationIn,
     db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager),
 ):
     await _get_exam(db, exam_id)
-    sync_key = secrets.token_urlsafe(32)  # shown once
     st = Station(
         exam_id=exam_id, station_code=payload.station_code, name=payload.name,
         region_id=payload.region_id, council_id=payload.council_id,
         managed_by=payload.managed_by or user.id,
-        sync_key_hash=hash_secret(sync_key), is_active=True,
+        sync_key_hash=None, is_active=True,
     )
     db.add(st)
     try:
         await db.flush()
     except IntegrityError:
         raise HTTPException(409, "station_code already exists")
-    return StationKeyOut(station_id=st.id, station_code=st.station_code, sync_key=sync_key)
+    return StationOut.model_validate(st)
 
 
 @router.get("/{exam_id}/stations", response_model=list[StationOut])
@@ -176,6 +173,53 @@ async def issue_credential(
         return CredentialOut(credential_id=cred.id, kind="ADMIN", password=password)
 
 
+@router.post("/{exam_id}/stations/{station_id}/reset-admin")
+async def reset_station_admin(
+    exam_id: uuid.UUID, station_id: int,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager),
+):
+    """Generate a new station admin password and return it once.
+
+    Use this when the original password (shown at package-generation time) was
+    lost. The new password is stored as a hash and shown exactly once here.
+    The station will accept it on next login after the next package import.
+    """
+    import secrets as _secrets
+    from ..models.assignments import StationCredential
+    from ..models.registry import User as _User
+
+    st = await _get_station(db, exam_id, station_id)
+
+    # Find the existing admin credential for this station
+    from sqlalchemy import select as _select
+    cred = (
+        await db.execute(
+            _select(StationCredential)
+            .join(ExamRoleAssignment, ExamRoleAssignment.id == StationCredential.exam_role_assignment_id)
+            .where(
+                StationCredential.station_id == station_id,
+                StationCredential.revoked_at.is_(None),
+                StationCredential.password_hash.isnot(None),
+            )
+            .order_by(StationCredential.issued_at.desc())
+        )
+    ).scalars().first()
+
+    if cred is None:
+        raise HTTPException(404, "No admin credential found for this station. Generate a package first.")
+
+    new_password = _secrets.token_urlsafe(12)
+    cred.password_hash = hash_secret(new_password)
+    await db.flush()
+
+    return {
+        "station_code": st.station_code,
+        "username": cred.admin_username or st.station_code,
+        "password": new_password,
+        "note": "Shown once. A new package must be generated and imported for this password to take effect on the station.",
+    }
+
+
 @router.post("/{exam_id}/stations/{station_id}/packages", response_model=PackageOut, status_code=201)
 async def generate_package(
     exam_id: uuid.UUID, station_id: int, payload: PackageGenerateIn,
@@ -193,10 +237,34 @@ async def generate_package(
         username=payload.admin_username, password=payload.admin_password,
     )
 
-    pkg = await generate_station_package(
-        db, station=st, schools=payload.schools,
-        subject_codes=payload.subjects, papers=[p.value for p in payload.papers],
+    from ..services.station_package import (
+        PackagePreparationError,
+        ScopeConflictError,
+        generate_station_package,
     )
+
+    try:
+        pkg, _machine_secret = await generate_station_package(
+            db, station=st, schools=payload.schools,
+            subject_codes=payload.subjects, papers=[p.value for p in payload.papers],
+            actor_id=user.id,
+        )
+    except ScopeConflictError as exc:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "SCOPE_CONFLICT",
+                "message": f"{len(exc.conflicts)} scope conflict(s) detected. "
+                           "Reassign conflicting scopes before generating this package.",
+                "conflicts": exc.conflicts,
+            },
+        )
+    except PackagePreparationError as exc:
+        raise HTTPException(
+            422,
+            detail={"code": exc.code, "message": exc.message, "detail": exc.detail},
+        )
+
     from ..services import notifications as notif
     await notif.record(db, action="PACKAGE_ISSUED", entity_type="station_package", entity_id=pkg.package_id,
                        actor_id=user.id, exam_id=exam_id,
@@ -220,32 +288,23 @@ async def list_packages(exam_id: uuid.UUID, station_id: int, db: AsyncSession = 
     return [PackageOut.model_validate(p) for p in rows]
 
 
-@router.get("/{exam_id}/stations/{station_id}/packages/{package_id}/download")
-async def download_package(
+@router.get("/{exam_id}/stations/{station_id}/packages/{package_id}/complete-bundle")
+async def download_complete_bundle(
     exam_id: uuid.UUID, station_id: int, package_id: str,
+    offline: bool = False,
     db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager),
 ):
-    await _get_station(db, exam_id, station_id)
-    pkg = await db.get(StationPackage, package_id)
-    if pkg is None or pkg.station_id != station_id:
-        raise HTTPException(404, "package not found")
-    if pkg.revoked_at is not None:
-        raise HTTPException(410, "package has been revoked")
-    # The bundle content: signed manifest + scope-only seed.
-    return pkg.manifest
+    """One-click complete bundle: Setup Kit + exam package pre-placed inside.
 
-
-@router.get("/{exam_id}/stations/{station_id}/packages/{package_id}/bundle")
-async def download_bundle(
-    exam_id: uuid.UUID, station_id: int, package_id: str,
-    db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager),
-):
-    """Complete, runnable station bundle (.zip): the offline station app +
-    vendored deps + one-click launcher, with this package pre-embedded so it
-    auto-imports on first boot. This is what an operator downloads and runs."""
+    Pass ?offline=true to include pre-built wheels for venues with no internet.
+    Default (online) bundle is smaller and installs packages from the internet.
+    """
     from fastapi.responses import Response
+    import io
+    import zipfile
 
-    from ..services.station_bundle import build_bundle_zip
+    from ..services.exam_package_zip import build_exam_package_zip
+    from ..services.station_setup_kit import build_setup_kit_zip
 
     st = await _get_station(db, exam_id, station_id)
     pkg = await db.get(StationPackage, package_id)
@@ -253,20 +312,110 @@ async def download_bundle(
         raise HTTPException(404, "package not found")
     if pkg.revoked_at is not None:
         raise HTTPException(410, "package has been revoked")
+
     try:
-        data = build_bundle_zip(
-            station_code=st.station_code,
-            exam_id=str(exam_id),
-            package_id=package_id,
-            package_bundle=pkg.manifest,
-        )
+        kit_bytes = build_setup_kit_zip(include_wheelhouse=offline)
     except FileNotFoundError as exc:
-        raise HTTPException(500, f"bundle sources unavailable: {exc}")
-    filename = f"lazeims-station-{st.station_code}-{package_id}.zip"
+        raise HTTPException(500, f"Setup kit sources unavailable: {exc}")
+
+    exam_pkg_bytes = build_exam_package_zip(pkg.manifest)
+    exam_pkg_filename = f"{st.station_code}-v{pkg.package_version}.lazeims-package.zip"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as out_zf:
+        with zipfile.ZipFile(io.BytesIO(kit_bytes)) as kit_zf:
+            for item in kit_zf.infolist():
+                out_zf.writestr(item, kit_zf.read(item.filename))
+        out_zf.writestr(
+            f"lazeims-station-setup/packages/{exam_pkg_filename}",
+            exam_pkg_bytes,
+        )
+
+    data = buf.getvalue()
+    suffix = "-offline" if offline else ""
+    filename = f"{st.station_code}-complete-bundle{suffix}.zip"
     return Response(
         content=data,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+async def download_package(
+    exam_id: uuid.UUID, station_id: int, package_id: str,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager),
+):
+    """Small signed exam package ZIP for import into an already-installed
+    Station. This is the normal per-exam download."""
+    from fastapi.responses import Response
+
+    from ..services.exam_package_zip import build_exam_package_zip
+
+    st = await _get_station(db, exam_id, station_id)
+    pkg = await db.get(StationPackage, package_id)
+    if pkg is None or pkg.station_id != station_id:
+        raise HTTPException(404, "package not found")
+    if pkg.revoked_at is not None:
+        raise HTTPException(410, "package has been revoked")
+    data = build_exam_package_zip(pkg.manifest)
+    filename = f"{st.station_code}-{pkg.package_version}-{package_id}.lazeims-package.zip"
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{exam_id}/stations/{station_id}/packages/{package_id}/bundle")
+async def download_bundle(
+    exam_id: uuid.UUID, station_id: int, package_id: str,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager),
+):
+    """Backwards-compatible alias for the signed exam package ZIP.
+
+    The Chief IT flow is now: install the Station once (Setup Kit), then
+    download this small ZIP per exam and import it in the local admin console.
+    """
+    from fastapi.responses import Response
+
+    from ..services.exam_package_zip import build_exam_package_zip
+
+    st = await _get_station(db, exam_id, station_id)
+    pkg = await db.get(StationPackage, package_id)
+    if pkg is None or pkg.station_id != station_id:
+        raise HTTPException(404, "package not found")
+    if pkg.revoked_at is not None:
+        raise HTTPException(410, "package has been revoked")
+    data = build_exam_package_zip(pkg.manifest)
+    filename = f"{st.station_code}-{pkg.package_version}-{package_id}.lazeims-package.zip"
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/station-kits/setup")
+async def download_setup_kit(
+    _: User = Depends(current_user),
+):
+    """The one-time-per-computer Station Setup Kit ZIP.
+
+    Any authenticated user may download this; there are no secrets inside
+    (only the public verification key and the Station application source).
+    """
+    from fastapi.responses import Response
+
+    from ..services.station_setup_kit import build_setup_kit_zip
+
+    try:
+        data = build_setup_kit_zip()
+    except FileNotFoundError as exc:
+        raise HTTPException(500, f"Setup kit sources unavailable: {exc}")
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="lazeims-station-kit.zip"'},
     )
 
 

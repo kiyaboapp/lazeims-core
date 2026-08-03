@@ -29,7 +29,7 @@ from ..deps import current_user
 from ..deps_exam import require_exam_admin
 from ..models.exam import Exam
 from ..models.processing import ExamProcessingLink, ExamProcessingRequest
-from ..models.registry import User
+from ..models.registry import User, ExamLevel
 from ..schemas_exam import ExamOut
 from ..services import backend_sis
 from ..services.backend_sis import BackendSisError
@@ -302,6 +302,34 @@ async def submit_for_processing(
 
     link = await _require_link(db, exam_id)
 
+    # Sync the exam definition before pushing collection. Best-effort: ExaMetrics
+    # may reject if processing has started; we log but continue with collection.
+    from ..services.exametrics_provision import build_subjects_payload
+    try:
+        level = await db.get(ExamLevel, exam.level_id)
+        level_name = (level.name if level else "").upper()
+        settings = get_settings()
+        subjects = await build_subjects_payload(db, exam)
+        filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
+        await backend_sis.upsert_exam_definition(
+            link.api_key,
+            external_ref=str(exam.id),
+            name=exam.name,
+            level=level_name,
+            zone_name=settings.zone_name.strip() or None,
+            filling_mode=filling_mode,
+            subjects=subjects,
+        )
+    except BackendSisError as exc:
+        if exc.status_code == 409 and exc.code == "EXAM_STATE_CONFLICT":
+            # Definition changed after processing started - that's fine, continue
+            pass
+        else:
+            raise _sis_http(exc)
+    except Exception:  # noqa: BLE001
+        # Any other error is best-effort, don't block collection
+        pass
+
     payload = await build_collection_payload(db, exam)
     try:
         await backend_sis.push_collection(link.api_key, link.backend_exam_id, payload)
@@ -443,6 +471,9 @@ async def extract_registrations(
     Unlike processing endpoints, extraction does not require backend_exam_id
     because the call is free and stateless (no exam path on the ExaMetrics side).
     """
+    # Extraction is stateless on the ExaMetrics side — it parses rows and returns
+    # them without persisting anything. It only needs a valid api_key, NOT a
+    # backend_exam_id, so _get_link() is correct here (not _require_link()).
     link = await _get_link(db, exam_id)
     if link is None:
         raise HTTPException(

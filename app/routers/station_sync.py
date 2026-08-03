@@ -26,7 +26,12 @@ from lazeims_common.schemas.station_sync import SyncRequest
 
 from ..db import get_session
 from ..models.assignments import Station
-from ..models.station import StationPackage, StationReconciliation, SyncEventReceipt
+from ..models.station import (
+    StationMachineCredential,
+    StationPackage,
+    StationReconciliation,
+    SyncEventReceipt,
+)
 from ..security import verify_secret
 from ..services import station_sync
 
@@ -34,18 +39,40 @@ router = APIRouter(prefix="/station/sync", tags=["station-sync"])
 
 
 async def authenticate_station(
-    db: AsyncSession, station_code: str, station_key: str | None,
+    db: AsyncSession,
+    station_code: str,
+    package_id: str | None,
+    credential_id: str | None,
+    package_secret: str | None,
+    legacy_station_key: str | None,
 ) -> Station:
-    if not station_key:
-        raise HTTPException(401, "Missing station credential")
+    """Authenticate a station using either the package-bound machine credential
+    (preferred) or the legacy station-level sync key (transition only)."""
     station = (
         await db.execute(select(Station).where(Station.station_code == station_code))
     ).scalar_one_or_none()
-    if station is None or not station.is_active or not station.sync_key_hash:
+    if station is None or not station.is_active:
         raise HTTPException(401, "Unknown or inactive station")
-    if not verify_secret(station.sync_key_hash, station_key):
-        raise HTTPException(401, "Invalid station credential")
-    return station
+
+    if credential_id and package_secret:
+        cred = (
+            await db.execute(
+                select(StationMachineCredential).where(
+                    StationMachineCredential.credential_id == credential_id,
+                    StationMachineCredential.station_id == station.id,
+                    StationMachineCredential.status == "ACTIVE",
+                )
+            )
+        ).scalar_one_or_none()
+        if cred is None:
+            raise HTTPException(401, "Unknown package credential")
+        if package_id and cred.package_id != package_id:
+            raise HTTPException(401, "Package credential does not match package_id")
+        if not verify_secret(cred.secret_hash, package_secret):
+            raise HTTPException(401, "Invalid package credential")
+        return station
+
+    raise HTTPException(401, "Missing package credential")
 
 
 async def _validate_package(db, station: Station, package_id: str) -> StationPackage:
@@ -62,8 +89,13 @@ async def sync_events(
     payload: SyncRequest,
     db: AsyncSession = Depends(get_session),
     x_station_key: str | None = Header(default=None, alias="X-Station-Key"),
+    x_package_credential_id: str | None = Header(default=None, alias="X-Package-Credential-Id"),
+    x_package_secret: str | None = Header(default=None, alias="X-Package-Secret"),
 ):
-    station = await authenticate_station(db, payload.station_code, x_station_key)
+    station = await authenticate_station(
+        db, payload.station_code, payload.package_id,
+        x_package_credential_id, x_package_secret, x_station_key,
+    )
     pkg = await _validate_package(db, station, payload.package_id)
     events = [e.model_dump(mode="json") for e in payload.events]
     result = await station_sync.process_events(
@@ -77,8 +109,13 @@ async def sync_status(
     station_code: str, package_id: str,
     db: AsyncSession = Depends(get_session),
     x_station_key: str | None = Header(default=None, alias="X-Station-Key"),
+    x_package_credential_id: str | None = Header(default=None, alias="X-Package-Credential-Id"),
+    x_package_secret: str | None = Header(default=None, alias="X-Package-Secret"),
 ):
-    station = await authenticate_station(db, station_code, x_station_key)
+    station = await authenticate_station(
+        db, station_code, package_id,
+        x_package_credential_id, x_package_secret, x_station_key,
+    )
     await _validate_package(db, station, package_id)
     accepted = await db.scalar(select(func.count()).select_from(SyncEventReceipt).where(
         SyncEventReceipt.station_id == station.id, SyncEventReceipt.status == "ACCEPTED"))
@@ -92,8 +129,13 @@ async def package_status(
     station_code: str, package_id: str,
     db: AsyncSession = Depends(get_session),
     x_station_key: str | None = Header(default=None, alias="X-Station-Key"),
+    x_package_credential_id: str | None = Header(default=None, alias="X-Package-Credential-Id"),
+    x_package_secret: str | None = Header(default=None, alias="X-Package-Secret"),
 ):
-    station = await authenticate_station(db, station_code, x_station_key)
+    station = await authenticate_station(
+        db, station_code, package_id,
+        x_package_credential_id, x_package_secret, x_station_key,
+    )
     pkg = await _validate_package(db, station, package_id)
     return {"package_id": pkg.package_id, "package_version": pkg.package_version,
             "revoked": pkg.revoked_at is not None, "rules_version": pkg.rules_version}
@@ -118,8 +160,13 @@ async def reconcile(
     payload: ReconcileIn,
     db: AsyncSession = Depends(get_session),
     x_station_key: str | None = Header(default=None, alias="X-Station-Key"),
+    x_package_credential_id: str | None = Header(default=None, alias="X-Package-Credential-Id"),
+    x_package_secret: str | None = Header(default=None, alias="X-Package-Secret"),
 ):
-    station = await authenticate_station(db, payload.station_code, x_station_key)
+    station = await authenticate_station(
+        db, payload.station_code, payload.package_id,
+        x_package_credential_id, x_package_secret, x_station_key,
+    )
     pkg = await _validate_package(db, station, payload.package_id)
     results = []
     all_matched = True
@@ -160,10 +207,15 @@ async def portable_import(
     payload: PortableIn,
     db: AsyncSession = Depends(get_session),
     x_station_key: str | None = Header(default=None, alias="X-Station-Key"),
+    x_package_credential_id: str | None = Header(default=None, alias="X-Package-Credential-Id"),
+    x_package_secret: str | None = Header(default=None, alias="X-Package-Secret"),
 ):
     from lazeims_common.portable import DIRECTION_ACKS, open_envelope, seal
 
-    station = await authenticate_station(db, payload.station_code, x_station_key)
+    station = await authenticate_station(
+        db, payload.station_code, None,
+        x_package_credential_id, x_package_secret, x_station_key,
+    )
     opened = open_envelope(payload.token, key=payload.key, expected_recipient="CENTRAL")
     body = opened.payload  # {package_id, events}
     pkg = await _validate_package(db, station, body["package_id"])

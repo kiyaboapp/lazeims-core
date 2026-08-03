@@ -18,18 +18,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from sqlalchemy import distinct, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lazeims_common.enums import ExamPhase, PaperType, RejectionCode
 from lazeims_common.errors import ValidationError
 
-from ..models.assignments import ScopeWriteAssignment
 from ..models.exam import (
     Exam,
     ExamSchool,
     ExamStudent,
-    ExamStudentSubject,
     ExamSubject,
 )
 from ..models.scoring import Question
@@ -95,44 +93,6 @@ async def compute_entry_open_readiness(db: AsyncSession, exam: Exam) -> Readines
         select(func.count()).select_from(ExamStudent).where(ExamStudent.exam_id == exam.id)
     )
     checks.append(ReadinessItem("has_students", bool(student_count), f"{student_count} student(s) registered"))
-
-    # In-scope (school, exam_subject, paper) combos: derived from actual
-    # registrations so we never demand assignments for subjects a school
-    # doesn't offer.
-    reg_rows = (
-        await db.execute(
-            select(distinct(ExamStudent.school_id), ExamStudentSubject.exam_subject_id)
-            .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
-            .where(ExamStudent.exam_id == exam.id)
-        )
-    ).all()
-
-    subject_by_id = {s.id: s for s in subjects}
-    expected: set[tuple[int, int, str]] = set()
-    for school_id, exam_subject_id in reg_rows:
-        subj = subject_by_id.get(exam_subject_id)
-        if subj is None:
-            continue
-        for paper in applicable_papers(subj):
-            expected.add((school_id, exam_subject_id, paper.value))
-
-    existing_rows = (
-        await db.execute(
-            select(
-                ScopeWriteAssignment.school_id,
-                ScopeWriteAssignment.exam_subject_id,
-                ScopeWriteAssignment.paper_type,
-            ).where(ScopeWriteAssignment.exam_id == exam.id)
-        )
-    ).all()
-    existing = {(r[0], r[1], r[2].value if hasattr(r[2], "value") else r[2]) for r in existing_rows}
-    missing = expected - existing
-    checks.append(ReadinessItem(
-        "writer_assignments_complete",
-        len(missing) == 0,
-        "all in-scope combinations assigned a writer" if not missing
-        else f"{len(missing)} scope(s) missing a writer assignment",
-    ))
 
     # Item-level exams need scoring configuration + a sealed version.
     filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")

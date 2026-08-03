@@ -1,29 +1,40 @@
-"""Station package generation — strict scope-only export.
+"""Central station package generation.
 
-A generated package contains ONLY the data inside its own ``assigned_scope``
-(schools + subjects + papers), plus the credential HASHES for this station's own
-assignments. It never contains out-of-scope rows and never a processing key.
-
-The manifest is built with the shared ``lazeims_common`` contract and signed with
-an HMAC over its canonical JSON using ``STATION_PACKAGE_INTEGRITY_KEY``.
+The single canonical generator: Ed25519-signed manifest, scope-only seed,
+per-package Argon2id machine credential, supersession pointer, applicable
+papers, Data Enterer scope data, and admin username. There is one contract
+(``station-package/v1``) — no legacy code paths in development.
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
+import secrets
 from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lazeims_common import RULES_VERSION
-from lazeims_common.enums import PaperType
-from lazeims_common.hashing import canonical_bytes, sha256_prefixed
-from lazeims_common.schemas.station_package import PackageScope, StationPackageManifest
+from lazeims_common.enums import PaperType, WriterMode
+from lazeims_common.hashing import sha256_prefixed
+from lazeims_common.schemas.station_package import (
+    CONTRACT_VERSION,
+    DataEntererScopeEntry,
+    MachineCredentialMeta,
+    MachineCredentialPayload,
+    PackageErrorCode,
+    PackageScope,
+    SigningMeta,
+    StationAdminEntry,
+    StationPackageManifest,
+)
+from lazeims_common.signing import sign_package_manifest
 
 from ..config import get_settings
+from ..enums import ExamRoleName
 from ..models.assignments import (
+    DataEntererScope,
     ExamRoleAssignment,
     ScopeWriteAssignment,
     Station,
@@ -37,22 +48,106 @@ from ..models.exam import (
 )
 from ..models.registry import School, Subject
 from ..models.scoring import Question, QuestionGroup, QuestionTopic
-from ..models.station import StationPackage
+from ..models.station import StationMachineCredential, StationPackage
+from ..security import hash_secret
 
 SOFTWARE_MIN_VERSION = "1.0.0"
 
 
-def sign_manifest(manifest: dict) -> str:
-    key = get_settings().station_package_integrity_key.encode("utf-8")
-    return "hmac-sha256:" + hmac.new(key, canonical_bytes(manifest), hashlib.sha256).hexdigest()
+class ScopeConflictError(Exception):
+    """Raised when ScopeWriteAssignment conflicts are detected."""
+
+    def __init__(self, conflicts: list[dict]):
+        self.conflicts = conflicts
+        super().__init__(f"{len(conflicts)} scope conflict(s) detected")
 
 
-def verify_manifest_signature(manifest: dict, signature: str) -> bool:
-    expected = sign_manifest(manifest)
-    return hmac.compare_digest(expected, signature)
+class PackagePreparationError(Exception):
+    """Raised for actionable package preparation failures."""
+
+    def __init__(self, code: str, message: str, detail: dict | None = None):
+        self.code = code
+        self.message = message
+        self.detail = detail or {}
+        super().__init__(message)
 
 
-async def _in_scope_exam_subjects(db, exam_id, subject_codes) -> list[ExamSubject]:
+# ── Scope collection-channel assignment ──────────────────────────────────────
+
+async def validate_and_assign_scopes(
+    db: AsyncSession,
+    *,
+    exam_id,
+    station_id: int,
+    school_ids: list[int],
+    exam_subject_ids: list[int],
+    paper_types: list[PaperType],
+    actor_id: int | None = None,
+) -> list[ScopeWriteAssignment]:
+    """Create/validate ScopeWriteAssignment rows for every selected combination.
+
+    Same-station reassignment is a no-op. Any other conflict raises
+    :class:`ScopeConflictError` with actionable detail so the operator can
+    reassign before regenerating the package.
+    """
+    conflicts: list[dict] = []
+    assignments: list[ScopeWriteAssignment] = []
+
+    for school_id in school_ids:
+        for es_id in exam_subject_ids:
+            for paper in paper_types:
+                existing = (
+                    await db.execute(
+                        select(ScopeWriteAssignment).where(
+                            ScopeWriteAssignment.exam_id == exam_id,
+                            ScopeWriteAssignment.school_id == school_id,
+                            ScopeWriteAssignment.exam_subject_id == es_id,
+                            ScopeWriteAssignment.paper_type == paper,
+                        )
+                    )
+                ).scalar_one_or_none()
+
+                if existing is None:
+                    new_assign = ScopeWriteAssignment(
+                        exam_id=exam_id,
+                        school_id=school_id,
+                        exam_subject_id=es_id,
+                        paper_type=paper,
+                        writer_mode=WriterMode.STATION,
+                        station_id=station_id,
+                        assigned_by=actor_id,
+                    )
+                    db.add(new_assign)
+                    assignments.append(new_assign)
+                elif existing.writer_mode != WriterMode.STATION:
+                    # ONLINE/CAL scope — reassign to this station (operator
+                    # is explicitly choosing to use a station for this scope)
+                    existing.writer_mode = WriterMode.STATION
+                    existing.station_id = station_id
+                    existing.assigned_by = actor_id
+                    assignments.append(existing)
+                elif existing.station_id != station_id:
+                    conflicts.append({
+                        "school_id": school_id,
+                        "exam_subject_id": es_id,
+                        "paper_type": paper.value,
+                        "current_mode": "STATION",
+                        "current_station_id": existing.station_id,
+                        "conflict_type": "different_station",
+                    })
+                else:
+                    assignments.append(existing)
+
+    if conflicts:
+        raise ScopeConflictError(conflicts)
+
+    await db.flush()
+    return assignments
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+async def _in_scope_exam_subjects(db: AsyncSession, exam_id, subject_codes) -> list[ExamSubject]:
     rows = (
         await db.execute(
             select(ExamSubject).join(Subject, Subject.id == ExamSubject.subject_id)
@@ -61,6 +156,92 @@ async def _in_scope_exam_subjects(db, exam_id, subject_codes) -> list[ExamSubjec
     ).all()
     return [r[0] for r in rows]
 
+
+async def _resolve_school_ids(db: AsyncSession, centre_numbers: list[str]) -> dict[str, int]:
+    rows = (
+        await db.execute(select(School).where(School.centre_number.in_(centre_numbers)))
+    ).scalars().all()
+    return {s.centre_number: s.id for s in rows}
+
+
+async def _build_de_scopes(db: AsyncSession, station_id: int) -> list[DataEntererScopeEntry]:
+    """Build DataEnterer scope entries for the station's DE credentials."""
+    cred_rows = (
+        await db.execute(
+            select(StationCredential, ExamRoleAssignment)
+            .join(ExamRoleAssignment, ExamRoleAssignment.id == StationCredential.exam_role_assignment_id)
+            .where(
+                StationCredential.station_id == station_id,
+                StationCredential.revoked_at.is_(None),
+                StationCredential.pin_hash.isnot(None),
+                ExamRoleAssignment.role == ExamRoleName.DATA_ENTERER,
+            )
+        )
+    ).all()
+
+    entries: list[DataEntererScopeEntry] = []
+    for cred, assignment in cred_rows:
+        scopes = (
+            await db.execute(
+                select(DataEntererScope).where(
+                    DataEntererScope.exam_role_assignment_id == assignment.id
+                )
+            )
+        ).scalars().all()
+        school_cns: list[str] = []
+        subject_codes: list[str] = []
+        for ds in scopes:
+            if ds.school_id:
+                school = await db.get(School, ds.school_id)
+                if school and school.centre_number not in school_cns:
+                    school_cns.append(school.centre_number)
+            if ds.subject_id:
+                subj = await db.get(Subject, ds.subject_id)
+                if subj and subj.code not in subject_codes:
+                    subject_codes.append(subj.code)
+        entries.append(DataEntererScopeEntry(
+            assignment_id=assignment.id,
+            initials=cred.initials or "",
+            pin_hash=cred.pin_hash or "",
+            school_centre_numbers=school_cns,
+            subject_codes=subject_codes,
+        ))
+    return entries
+
+
+async def _build_admin_entry(db: AsyncSession, station_id: int) -> StationAdminEntry | None:
+    cred = (
+        await db.execute(
+            select(StationCredential, ExamRoleAssignment)
+            .join(ExamRoleAssignment, ExamRoleAssignment.id == StationCredential.exam_role_assignment_id)
+            .where(
+                StationCredential.station_id == station_id,
+                StationCredential.revoked_at.is_(None),
+                StationCredential.password_hash.isnot(None),
+                ExamRoleAssignment.role == ExamRoleName.EXAM_ADMIN,
+            )
+            .order_by(StationCredential.issued_at.desc())
+        )
+    ).first()
+    if cred is None:
+        return None
+    sc, ra = cred
+    username = sc.admin_username or sc.initials or "admin"
+    return StationAdminEntry(
+        assignment_id=ra.id,
+        username=username,
+        password_hash=sc.password_hash or "",
+    )
+
+
+def _generate_machine_credential() -> tuple[str, str, str]:
+    """Return (credential_id, plaintext_secret, argon2id_hash)."""
+    credential_id = f"mc_{secrets.token_hex(12)}"
+    plaintext_secret = secrets.token_urlsafe(32)
+    return credential_id, plaintext_secret, hash_secret(plaintext_secret)
+
+
+# ── Seed builder (scope-only) ────────────────────────────────────────────────
 
 async def build_package_seed(
     db: AsyncSession,
@@ -74,21 +255,18 @@ async def build_package_seed(
     """Build the scope-only seed payload (natural keys throughout)."""
     paper_set = {PaperType(p) for p in papers}
 
-    # schools (only those in scope)
     school_rows = (
         await db.execute(select(School).where(School.centre_number.in_(schools)))
     ).scalars().all()
     school_by_id = {s.id: s for s in school_rows}
     in_scope_school_ids = set(school_by_id)
 
-    # subjects (only in-scope)
     exam_subjects = await _in_scope_exam_subjects(db, exam.id, subject_codes)
     es_by_id = {es.id: es for es in exam_subjects}
-    subject_by_id = {}
+    subject_by_id: dict[int, Subject] = {}
     for es in exam_subjects:
         subject_by_id[es.id] = await db.get(Subject, es.subject_id)
 
-    # students: in-scope school AND registered for an in-scope subject
     student_rows = (
         await db.execute(
             select(ExamStudent).where(
@@ -108,25 +286,27 @@ async def build_package_seed(
         )
     ).scalars().all()
 
-    # only keep students that actually have an in-scope registration
     kept_student_ids = {e.exam_student_id for e in ess_rows}
-    students_out = []
-    for sid in kept_student_ids:
-        s = student_by_id[sid]
-        students_out.append({
-            "student_id": s.student_id,
-            "centre_number": school_by_id[s.school_id].centre_number,
-            "first_name": s.first_name, "middle_name": s.middle_name,
-            "surname": s.surname, "sex": s.sex.value,
-        })
+    students_out = [
+        {
+            "student_id": student_by_id[sid].student_id,
+            "centre_number": school_by_id[student_by_id[sid].school_id].centre_number,
+            "first_name": student_by_id[sid].first_name,
+            "middle_name": student_by_id[sid].middle_name,
+            "surname": student_by_id[sid].surname,
+            "sex": student_by_id[sid].sex.value,
+        }
+        for sid in kept_student_ids
+    ]
     registrations_out = [
-        {"student_id": student_by_id[e.exam_student_id].student_id,
-         "subject_code": subject_by_id[e.exam_subject_id].code}
+        {
+            "student_id": student_by_id[e.exam_student_id].student_id,
+            "subject_code": subject_by_id[e.exam_subject_id].code,
+        }
         for e in ess_rows
     ]
 
-    # subjects + scoring config restricted to in-scope papers
-    subjects_out = []
+    subjects_out: list[dict] = []
     for es in exam_subjects:
         subj = subject_by_id[es.id]
         groups = (
@@ -146,12 +326,12 @@ async def build_package_seed(
             )
         ).scalars().all()
         gcode_by_id = {g.id: g.code for g in groups}
-        q_out = []
+        questions_out = []
         for q in questions:
             topics = (
                 await db.execute(select(QuestionTopic).where(QuestionTopic.question_id == q.id))
             ).scalars().all()
-            q_out.append({
+            questions_out.append({
                 "paper_type": q.paper_type.value,
                 "question_number": q.question_number,
                 "group_code": gcode_by_id.get(q.group_id) if q.group_id else None,
@@ -167,17 +347,27 @@ async def build_package_seed(
                 "THEORY2": es.total_marks_theory2,
                 "PRACTICAL": es.total_marks_practical,
             },
-            "groups": [{"paper_type": g.paper_type.value, "code": g.code, "name": g.name,
-                        "instruction": g.instruction, "pick_count": g.pick_count} for g in groups],
-            "questions": q_out,
+            "groups": [
+                {
+                    "paper_type": g.paper_type.value,
+                    "code": g.code,
+                    "name": g.name,
+                    "instruction": g.instruction,
+                    "pick_count": g.pick_count,
+                }
+                for g in groups
+            ],
+            "questions": questions_out,
         })
 
-    # credentials: ONLY hashes for THIS station's assignments (never the user directory)
     cred_rows = (
         await db.execute(
             select(StationCredential, ExamRoleAssignment)
             .join(ExamRoleAssignment, ExamRoleAssignment.id == StationCredential.exam_role_assignment_id)
-            .where(StationCredential.station_id == station.id, StationCredential.revoked_at.is_(None))
+            .where(
+                StationCredential.station_id == station.id,
+                StationCredential.revoked_at.is_(None),
+            )
         )
     ).all()
     credentials_out = [
@@ -187,6 +377,7 @@ async def build_package_seed(
             "pin_hash": sc.pin_hash,
             "initials": sc.initials,
             "password_hash": sc.password_hash,
+            "admin_username": sc.admin_username,
         }
         for sc, ra in cred_rows
     ]
@@ -202,6 +393,8 @@ async def build_package_seed(
     }
 
 
+# ── Entry point ──────────────────────────────────────────────────────────────
+
 async def generate_station_package(
     db: AsyncSession,
     *,
@@ -209,39 +402,127 @@ async def generate_station_package(
     schools: list[str],
     subject_codes: list[str],
     papers: list[str],
-) -> StationPackage:
+    actor_id: int | None = None,
+) -> tuple[StationPackage, str]:
+    """Generate a station package.
+
+    Returns (StationPackage, plaintext_machine_secret). Central stores only the
+    Argon2id hash of the machine secret; the plaintext appears once in the
+    bundle payload and is never persisted centrally.
+    """
+    settings = get_settings()
     exam = await db.get(Exam, station.exam_id)
 
-    # next version for this station
-    last = (
+    central_url = settings.central_public_base_url.strip()
+    if settings.is_production and not central_url:
+        raise PackagePreparationError(
+            PackageErrorCode.CENTRAL_URL_NOT_CONFIGURED,
+            "CENTRAL_PUBLIC_BASE_URL is not configured. Stations need this "
+            "for online-first setup and direct sync.",
+        )
+
+    school_map = await _resolve_school_ids(db, schools)
+    missing_schools = set(schools) - set(school_map.keys())
+    if missing_schools:
+        raise PackagePreparationError(
+            PackageErrorCode.NO_REGISTERED_STUDENTS,
+            f"Schools not found: {sorted(missing_schools)}",
+            {"missing": sorted(missing_schools)},
+        )
+    school_ids = list(school_map.values())
+
+    paper_set = [PaperType(p) for p in papers]
+
+    exam_subjects = await _in_scope_exam_subjects(db, exam.id, subject_codes)
+    es_ids = [es.id for es in exam_subjects]
+    if not es_ids:
+        raise PackagePreparationError(
+            PackageErrorCode.MISSING_APPLICABLE_PAPERS,
+            f"No exam subjects found for codes: {subject_codes}",
+        )
+
+    await validate_and_assign_scopes(
+        db,
+        exam_id=exam.id,
+        station_id=station.id,
+        school_ids=school_ids,
+        exam_subject_ids=es_ids,
+        paper_types=paper_set,
+        actor_id=actor_id,
+    )
+
+    seed = await build_package_seed(
+        db, exam=exam, station=station,
+        schools=schools, subject_codes=subject_codes, papers=papers,
+    )
+
+    last_pkg = (
         await db.execute(
-            select(StationPackage.package_version).where(StationPackage.station_id == station.id)
+            select(StationPackage).where(StationPackage.station_id == station.id)
             .order_by(StationPackage.package_version.desc())
         )
     ).scalars().first()
-    version = (last or 0) + 1
+    version = (last_pkg.package_version if last_pkg else 0) + 1
+    supersedes_id = last_pkg.package_id if last_pkg else None
 
-    seed = await build_package_seed(
-        db, exam=exam, station=station, schools=schools, subject_codes=subject_codes, papers=papers,
-    )
     configuration_hash = sha256_prefixed(seed)
     package_id = "pkg_" + hashlib.sha256(
         f"{station.station_code}:{version}:{configuration_hash}".encode()
     ).hexdigest()[:24]
 
+    credential_id, plaintext_secret, secret_hash = _generate_machine_credential()
+
+    de_scopes = await _build_de_scopes(db, station.id)
+    admin_entry = await _build_admin_entry(db, station.id)
+
     manifest_model = StationPackageManifest(
         package_id=package_id,
         package_version=version,
+        supersedes_package_id=supersedes_id,
         rules_version=RULES_VERSION,
         software_min_version=SOFTWARE_MIN_VERSION,
         station_code=station.station_code,
         exam_id=str(exam.id),
+        exam_code=getattr(exam, "exam_code", "") or "",
+        exam_name=getattr(exam, "name", "") or "",
         configuration_hash=configuration_hash,
         issued_at=datetime.now(timezone.utc),
         scope=PackageScope(schools=schools, subjects=subject_codes, papers=papers),
+        central_base_url=central_url,
+        machine_credential=MachineCredentialMeta(
+            credential_id=credential_id,
+            algorithm="argon2id",
+        ),
+        signing=SigningMeta(algorithm="ed25519"),
+        station_admin=admin_entry,
+        data_enterers=de_scopes,
     )
     manifest = manifest_model.model_dump(mode="json")
-    manifest["signature"] = sign_manifest(manifest)
+
+    # Ensure the signing key path env var is populated when configured.
+    import os as _os
+    if settings.package_signing_private_key_path:
+        _os.environ.setdefault(
+            "PACKAGE_SIGNING_PRIVATE_KEY_PATH",
+            settings.package_signing_private_key_path,
+        )
+    signature = sign_package_manifest(manifest)
+
+    machine_credential_payload = MachineCredentialPayload(
+        credential_id=credential_id,
+        package_id=package_id,
+        station_code=station.station_code,
+        secret=plaintext_secret,
+        central_base_url=central_url,
+    ).model_dump(mode="json")
+
+    package_bundle = {
+        "manifest": manifest,
+        "seed": seed,
+        "signature": signature,
+        "contract_version": CONTRACT_VERSION,
+        "machine_credential": machine_credential_payload,
+    }
 
     pkg = StationPackage(
         package_id=package_id,
@@ -252,9 +533,22 @@ async def generate_station_package(
         software_min_version=SOFTWARE_MIN_VERSION,
         configuration_hash=configuration_hash,
         assigned_scope={"schools": schools, "subjects": subject_codes, "papers": papers},
-        manifest={"manifest": manifest, "seed": seed},
+        manifest=package_bundle,
         issued_at=datetime.now(timezone.utc),
+        supersedes_package_id=supersedes_id,
     )
     db.add(pkg)
     await db.flush()
-    return pkg
+
+    db.add(StationMachineCredential(
+        credential_id=credential_id,
+        package_id=package_id,
+        station_id=station.id,
+        secret_hash=secret_hash,
+        algorithm="argon2id",
+        status="ACTIVE",
+        issued_at=datetime.now(timezone.utc),
+    ))
+    await db.flush()
+
+    return pkg, plaintext_secret
