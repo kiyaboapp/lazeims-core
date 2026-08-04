@@ -134,14 +134,23 @@ async def main() -> None:
         if missing:
             raise SystemExit(f"Exam is missing required subject codes: {missing}")
 
-        # 3. enrolled schools
+        # 3. enrolled schools (only those matching the exam's level)
+        from app.models.registry import ExamLevel as _EL
+        exam_level = await db.get(_EL, exam.level_id)
+        level_name = (exam_level.name if exam_level else "").upper()
+        school_stmt = (
+            select(School)
+            .join(ExamSchool, ExamSchool.school_id == School.id)
+            .where(ExamSchool.exam_id == exam.id)
+        )
+        if level_name in ("SFNA", "PSLE"):
+            school_stmt = school_stmt.where(School.is_primary == True)
+        elif level_name in ("FTNA", "CSEE"):
+            school_stmt = school_stmt.where(School.is_olevel == True)
+        elif level_name == "ACSEE":
+            school_stmt = school_stmt.where(School.is_alevel == True)
         school_rows = (
-            await db.execute(
-                select(School)
-                .join(ExamSchool, ExamSchool.school_id == School.id)
-                .where(ExamSchool.exam_id == exam.id)
-                .order_by(School.centre_number)
-            )
+            await db.execute(school_stmt.order_by(School.centre_number))
         ).scalars().all()
         if not args.all:
             school_rows = school_rows[: args.schools]

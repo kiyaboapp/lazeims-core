@@ -26,6 +26,7 @@ from lazeims_common.schemas.station_sync import SyncRequest
 
 from ..db import get_session
 from ..models.assignments import Station
+from ..models.registry import School
 from ..models.station import (
     StationMachineCredential,
     StationPackage,
@@ -227,3 +228,113 @@ async def portable_import(
     ack_token = seal(result, key=payload.key, sender="CENTRAL", recipient=station.station_code,
                      direction=DIRECTION_ACKS, sequence=opened.sequence)
     return {"ack_token": ack_token}
+
+
+# ---------------- pull snapshot (Blueprint §10) ----------------
+
+@router.get("/pull/snapshot")
+async def pull_snapshot(
+    station_code: str,
+    db: AsyncSession = Depends(get_session),
+    x_package_credential_id: str | None = Header(default=None, alias="X-Package-Credential-Id"),
+    x_package_secret: str | None = Header(default=None, alias="X-Package-Secret"),
+):
+    """Return current state of marks/attendance for this station's scopes.
+
+    Authenticated by machine credential (same as sync). Returns per-scope
+    digest and counts so the station can verify data landed on Central.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    from ..models.assignments import FinalizedScope, ScopeWriteAssignment
+    from ..models.exam import ExamStudent, ExamStudentSubject, ExamSubject
+    from ..models.marks import TotalMark
+    from ..models.registry import Subject
+
+    station = await authenticate_station(
+        db, station_code, None,
+        x_package_credential_id, x_package_secret, None,
+    )
+    exam_id = station.exam_id
+
+    # Find all scopes assigned to this station (via ScopeWriteAssignment)
+    assignments = (
+        await db.execute(
+            select(ScopeWriteAssignment).where(
+                ScopeWriteAssignment.station_id == station.id,
+            )
+        )
+    ).scalars().all()
+
+    scopes_out = []
+    for swa in assignments:
+        school = await db.get(School, swa.school_id)
+        es = (
+            await db.execute(
+                select(ExamSubject).where(ExamSubject.id == swa.exam_subject_id)
+            )
+        ).scalar_one_or_none()
+        if not es or not school:
+            continue
+
+        subject = await db.get(Subject, es.subject_id)
+        paper = swa.paper_type
+
+        try:
+            digest, counts = await station_sync.compute_central_scope_digest(
+                db, exam_id=exam_id, centre_number=school.centre_number,
+                subject_code=subject.code, paper_type=paper,
+            )
+        except Exception:
+            digest, counts = "error", {}
+
+        # Get the latest station_occurred_at for this scope
+        last_updated = (
+            await db.execute(
+                select(func.max(TotalMark.station_occurred_at)).where(
+                    TotalMark.exam_student_subject_id.in_(
+                        select(ExamStudentSubject.id).where(
+                            ExamStudentSubject.exam_subject_id == es.id,
+                            ExamStudentSubject.exam_student_id.in_(
+                                select(ExamStudent.id).where(
+                                    ExamStudent.school_id == school.id,
+                                    ExamStudent.exam_id == exam_id,
+                                )
+                            )
+                        )
+                    ),
+                    TotalMark.paper_type == paper,
+                )
+            )
+        ).scalar_one_or_none()
+
+        # Check if finalized
+        finalized = (
+            await db.execute(
+                select(FinalizedScope).where(
+                    FinalizedScope.exam_id == exam_id,
+                    FinalizedScope.school_id == school.id,
+                    FinalizedScope.exam_subject_id == es.id,
+                    FinalizedScope.paper_type == paper,
+                )
+            )
+        ).scalar_one_or_none()
+
+        scopes_out.append({
+            "centre_number": school.centre_number,
+            "subject_code": subject.code,
+            "paper_type": paper.value,
+            "finalized": finalized is not None,
+            "student_count": counts.get("total", 0),
+            "marks_count": counts.get("present_with_marks", 0),
+            "absent_count": counts.get("absent", 0),
+            "scope_digest": digest,
+            "last_updated_at": last_updated.isoformat() if last_updated else None,
+        })
+
+    return {
+        "station_code": station.station_code,
+        "exam_id": str(exam_id),
+        "generated_at": _dt.now(_tz.utc).isoformat(),
+        "scopes": scopes_out,
+    }

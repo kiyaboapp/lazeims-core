@@ -12,7 +12,7 @@ import secrets
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +25,7 @@ from ..models.assignments import (
     FinalizedScope,
     Station,
     StationCredential,
+    StationSchool,
 )
 from ..models.exam import Exam
 from ..models.registry import User
@@ -36,6 +37,7 @@ from ..schemas_station import (
     PackageOut,
     StationIn,
     StationOut,
+    StationScopeIn,
 )
 from ..security import hash_secret
 
@@ -73,6 +75,14 @@ async def _get_station(db: AsyncSession, exam_id: uuid.UUID, station_id: int) ->
     return st
 
 
+async def _get_station_school_ids(db: AsyncSession, station_id: int) -> list[int]:
+    """Return school_ids associated with a station."""
+    rows = (await db.execute(
+        select(StationSchool.school_id).where(StationSchool.station_id == station_id)
+    )).scalars().all()
+    return list(rows)
+
+
 @router.post("/{exam_id}/stations", response_model=StationOut, status_code=201)
 async def create_station(
     exam_id: uuid.UUID, payload: StationIn,
@@ -81,7 +91,9 @@ async def create_station(
     await _get_exam(db, exam_id)
     st = Station(
         exam_id=exam_id, station_code=payload.station_code, name=payload.name,
+        scope_mode=payload.scope_mode,
         region_id=payload.region_id, council_id=payload.council_id,
+        ward_id=payload.ward_id,
         managed_by=payload.managed_by or user.id,
         sync_key_hash=None, is_active=True,
     )
@@ -90,13 +102,56 @@ async def create_station(
         await db.flush()
     except IntegrityError:
         raise HTTPException(409, "station_code already exists")
-    return StationOut.model_validate(st)
+    # Save school associations if SCHOOLS mode
+    if payload.scope_mode == 'SCHOOLS' and payload.school_ids:
+        for sid in payload.school_ids:
+            db.add(StationSchool(station_id=st.id, school_id=sid))
+        await db.flush()
+    school_ids = await _get_station_school_ids(db, st.id)
+    out = StationOut.model_validate(st)
+    out.school_ids = school_ids
+    return out
 
 
 @router.get("/{exam_id}/stations", response_model=list[StationOut])
 async def list_stations(exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager)):
     rows = (await db.execute(select(Station).where(Station.exam_id == exam_id))).scalars().all()
-    return [StationOut.model_validate(s) for s in rows]
+    result = []
+    for s in rows:
+        out = StationOut.model_validate(s)
+        out.school_ids = await _get_station_school_ids(db, s.id)
+        result.append(out)
+    return result
+
+
+@router.patch("/{exam_id}/stations/{station_id}/scope", response_model=StationOut)
+async def update_station_scope(
+    exam_id: uuid.UUID, station_id: int, payload: StationScopeIn,
+    db: AsyncSession = Depends(get_session), user: User = Depends(require_station_manager),
+):
+    """Update a station's scope (mode + location or school list)."""
+    st = await _get_station(db, exam_id, station_id)
+    st.scope_mode = payload.scope_mode
+    if payload.scope_mode == 'LOCATION':
+        st.region_id = payload.region_id
+        st.council_id = payload.council_id
+        st.ward_id = payload.ward_id
+        # Clear school associations
+        await db.execute(delete(StationSchool).where(StationSchool.station_id == station_id))
+    else:
+        # SCHOOLS mode: clear location fields, set school associations
+        st.region_id = None
+        st.council_id = None
+        st.ward_id = None
+        await db.execute(delete(StationSchool).where(StationSchool.station_id == station_id))
+        if payload.school_ids:
+            for sid in payload.school_ids:
+                db.add(StationSchool(station_id=station_id, school_id=sid))
+    await db.flush()
+    school_ids = await _get_station_school_ids(db, station_id)
+    out = StationOut.model_validate(st)
+    out.school_ids = school_ids
+    return out
 
 
 @router.get("/{exam_id}/stations/credential-candidates")

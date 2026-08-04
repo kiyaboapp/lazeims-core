@@ -106,26 +106,9 @@ async def collection_progress(db: AsyncSession, *, exam: Exam) -> dict[str, Any]
         ).all()
     }
 
-    # ── writer mode per scope (ONLINE unless a ScopeWriteAssignment says otherwise) ─
-    # Station and Excel scopes have explicit assignments; everything else is ONLINE.
-    from ..models.assignments import ScopeWriteAssignment
-    wa_rows = (
-        await db.execute(
-            select(
-                ScopeWriteAssignment.school_id,
-                ScopeWriteAssignment.exam_subject_id,
-                ScopeWriteAssignment.paper_type,
-                ScopeWriteAssignment.writer_mode,
-            ).where(
-                ScopeWriteAssignment.exam_id == exam_id,
-                ScopeWriteAssignment.school_id.in_(school_ids),
-            )
-        )
-    ).all()
-    writer_mode_map: dict[tuple[int, int, str], str] = {
-        (r.school_id, r.exam_subject_id, _paper_value(r.paper_type)): _paper_value(r.writer_mode)
-        for r in wa_rows
-    }
+    # ── writer mode per scope (historical — no longer enforced) ────────────────
+    # Kept in response for backward compat but always empty.
+    writer_mode_map: dict[tuple[int, int, str], str] = {}
 
     # ── expected candidates per (school, subject) ─────────────────────────────
     expected = {

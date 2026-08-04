@@ -77,6 +77,9 @@ class School(Base, TimestampMixin):
     school_type: Mapped[SchoolType] = mapped_column(
         _enum(SchoolType, "school_type"), default=SchoolType.UNKNOWN, nullable=False
     )
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_olevel: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_alevel: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # All geography links are optional but must be internally consistent when set.
     region_id: Mapped[int | None] = mapped_column(ForeignKey("regions.id"), nullable=True, index=True)
     council_id: Mapped[int | None] = mapped_column(ForeignKey("councils.id"), nullable=True, index=True)

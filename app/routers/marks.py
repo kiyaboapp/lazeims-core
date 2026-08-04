@@ -37,7 +37,7 @@ from ..deps_exam import get_exam_roles, require_exam_role
 from ..enums import ExamRoleName, StandingRoleName
 from ..models.assignments import FinalizedScope, ScopeRevision
 from ..models.exam import Exam, ExamStudent, ExamStudentSubject, ExamSubject
-from ..models.marks import ExamIncident
+from ..models.marks import Attendance, ExamIncident
 from ..models.registry import User
 from ..schemas_marks import (
     AttendanceIn,
@@ -133,6 +133,17 @@ async def transcribe_attendance(
     if await is_scope_finalized(db, exam_id=exam_id, school_id=scope.student.school_id,
                                 exam_subject_id=payload.exam_subject_id, paper_type=payload.paper_type):
         raise _vhttp(ValidationError(RejectionCode.SCOPE_ALREADY_FINALIZED, "Scope is finalized."))
+    # Prevent marking absent if marks already exist for this student-subject
+    if not payload.is_present:
+        from ..models.marks import TotalMark
+        has_marks = (await db.execute(
+            select(func.count()).where(
+                TotalMark.exam_student_subject_id == scope.exam_student_subject.id,
+                TotalMark.paper_type == payload.paper_type,
+            )
+        )).scalar_one()
+        if has_marks > 0:
+            raise HTTPException(422, "Cannot mark absent — marks already entered for this paper.")
     row = await upsert_attendance(
         db, exam_student_subject_id=scope.exam_student_subject.id, paper_type=payload.paper_type,
         is_present=payload.is_present, source=payload.source, actor_id=user.id,
@@ -147,9 +158,11 @@ async def set_cal_baseline(
 ):
     """Chief IT optional subject-wide baseline (Attendance paper_type=ALL)."""
     from lazeims_common.enums import AttendanceSource
+    from ..models.marks import TotalMark
     exam = await _get_exam(db, exam_id)
     _require_entry_open(exam)
     written = 0
+    errors: list[dict] = []
     for entry in payload.entries:
         try:
             scope = await resolve_student_scope(
@@ -159,12 +172,25 @@ async def set_cal_baseline(
             raise _vhttp(exc)
         if scope.student.school_id != school_id:
             continue
+        # Prevent marking absent if marks already exist for this student-subject
+        if not entry.is_present:
+            has_marks = (await db.execute(
+                select(func.count()).where(TotalMark.exam_student_subject_id == scope.exam_student_subject.id)
+            )).scalar_one()
+            if has_marks > 0:
+                errors.append({
+                    "student_id": entry.student_id,
+                    "reason": "Cannot mark absent — marks already entered for this student-subject.",
+                })
+                continue
         await upsert_attendance(
             db, exam_student_subject_id=scope.exam_student_subject.id, paper_type=PaperType.ALL,
             is_present=entry.is_present, source=AttendanceSource.SUPERVISOR_CAL_TRANSCRIPTION,
             actor_id=user.id,
         )
         written += 1
+    if errors:
+        raise HTTPException(422, detail={"baseline_rows_written": written, "errors": errors})
     return {"baseline_rows_written": written}
 
 
@@ -316,22 +342,42 @@ async def scope_roster(
     exam_id: uuid.UUID, school_id: int, exam_subject_id: int, paper_type: PaperType,
     db: AsyncSession = Depends(get_session), user: User = Depends(_ENTRY_ACTOR),
 ):
-    """Students in a scope with their current attendance + marks status (online grid)."""
+    """Students in a scope with their current attendance + marks status (online grid).
+
+    For ITEM_LEVEL exams, also returns:
+      - ``questions``: ordered list of {number, max_marks} for the paper
+      - per-student ``item_marks``: dict of question_number -> marks_obtained
+
+    Optimised: all data loaded in bulk (no per-student queries).
+    """
     from sqlalchemy import select as _select
     from ..models.exam import ExamStudent, ExamStudentSubject
-    from ..models.marks import ItemMark, TotalMark
+    from ..models.marks import Attendance as _Att, ItemMark, TotalMark
     from ..models.scoring import Question
-    from ..services.attendance import resolve_effective_attendance
+    from lazeims_common.enums import PaperType as _PT
+    from lazeims_common.validation.attendance import (
+        AttendanceRow as _AR, effective_attendance,
+    )
 
     exam = await _get_exam(db, exam_id)
     es = await _resolve_scope_subject(db, exam_id, exam_subject_id)
     mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
-    qids = []
-    if mode == "ITEM_LEVEL":
-        qids = list((await db.execute(
-            _select(Question.id).where(Question.exam_subject_id == es.id, Question.paper_type == paper_type)
-        )).scalars().all())
 
+    # For ITEM_LEVEL: load question config
+    questions_out: list[dict] = []
+    qid_to_number: dict[int, str] = {}
+    qids: list[int] = []
+    if mode == "ITEM_LEVEL":
+        q_rows = (await db.execute(
+            _select(Question)
+            .where(Question.exam_subject_id == es.id, Question.paper_type == paper_type)
+            .order_by(Question.question_number)
+        )).scalars().all()
+        questions_out = [{"number": q.question_number, "max_marks": float(q.max_marks)} for q in q_rows]
+        qid_to_number = {q.id: q.question_number for q in q_rows}
+        qids = list(qid_to_number.keys())
+
+    # 1) Load all students in this scope (single query)
     rows = (await db.execute(
         _select(ExamStudent, ExamStudentSubject)
         .join(ExamStudentSubject, ExamStudentSubject.exam_student_id == ExamStudent.id)
@@ -340,25 +386,198 @@ async def scope_roster(
         .order_by(ExamStudent.student_id)
     )).all()
 
+    if not rows:
+        result: dict = {"mode": mode, "students": []}
+        if mode == "ITEM_LEVEL":
+            result["questions"] = questions_out
+        return result
+
+    ess_ids = [ess.id for _, ess in rows]
+
+    # 2) Bulk-load attendance for all students in this scope (single query)
+    att_rows = (await db.execute(
+        _select(_Att.exam_student_subject_id, _Att.paper_type, _Att.is_present)
+        .where(_Att.exam_student_subject_id.in_(ess_ids))
+    )).all()
+    # Group by ess_id
+    att_by_ess: dict[int, list[_AR]] = {}
+    for ess_id, pt, is_present in att_rows:
+        att_by_ess.setdefault(ess_id, []).append(_AR(paper_type=pt, is_present=is_present))
+
+    # 3) Bulk-load marks (single query)
+    if mode == "ITEM_LEVEL":
+        # All item marks for these students + these questions
+        im_all: dict[int, dict[str, float]] = {}
+        if qids:
+            im_rows = (await db.execute(
+                _select(ItemMark.exam_student_subject_id, ItemMark.question_id, ItemMark.marks_obtained)
+                .where(
+                    ItemMark.exam_student_subject_id.in_(ess_ids),
+                    ItemMark.question_id.in_(qids),
+                )
+            )).all()
+            for ess_id, qid, marks in im_rows:
+                im_all.setdefault(ess_id, {})[qid_to_number[qid]] = float(marks)
+    else:
+        # All total marks for these students + this paper
+        tm_map: dict[int, float] = {}
+        tm_rows = (await db.execute(
+            _select(TotalMark.exam_student_subject_id, TotalMark.total_marks_obtained)
+            .where(
+                TotalMark.exam_student_subject_id.in_(ess_ids),
+                TotalMark.paper_type == paper_type,
+            )
+        )).all()
+        for ess_id, total in tm_rows:
+            tm_map[ess_id] = float(total)
+
+    # 4) Assemble response (no DB queries in this loop)
     out = []
     for student, ess in rows:
-        present = await resolve_effective_attendance(db, ess.id, paper_type)
+        att_list = att_by_ess.get(ess.id, [])
+        present = effective_attendance(att_list, paper_type)
+
         if mode == "ITEM_LEVEL":
-            has_marks = bool(qids) and (await db.scalar(
-                _select(func.count()).select_from(ItemMark).where(
-                    ItemMark.exam_student_subject_id == ess.id, ItemMark.question_id.in_(qids)))) == len(qids)
-            total = None
+            item_marks = im_all.get(ess.id, {})
+            has_marks = len(item_marks) == len(qids) and len(qids) > 0
+            out.append({
+                "student_id": student.student_id,
+                "full_name": student.full_name,
+                "attendance": present, "has_marks": has_marks, "total": None,
+                "item_marks": item_marks,
+            })
         else:
-            tm = (await db.execute(_select(TotalMark.total_marks_obtained).where(
-                TotalMark.exam_student_subject_id == ess.id, TotalMark.paper_type == paper_type))).scalar_one_or_none()
-            has_marks = tm is not None
-            total = None if tm is None else float(tm)
-        out.append({
+            total = tm_map.get(ess.id)
+            out.append({
+                "student_id": student.student_id,
+                "full_name": student.full_name,
+                "attendance": present, "has_marks": total is not None,
+                "total": total,
+            })
+
+    result = {"mode": mode, "students": out}
+    if mode == "ITEM_LEVEL":
+        result["questions"] = questions_out
+    return result
+
+
+@router.get("/{exam_id}/scopes/report")
+async def scope_report(
+    exam_id: uuid.UUID, school_id: int, exam_subject_id: int, paper_type: PaperType,
+    db: AsyncSession = Depends(get_session), user: User = Depends(_ENTRY_ACTOR),
+):
+    """Generate marks report data for a scope (school + subject + paper)."""
+    from ..models.registry import School as _School, Subject as _Subject
+    from ..models.marks import TotalMark, ItemMark
+    from ..models.scoring import Question
+
+    exam = await _get_exam(db, exam_id)
+    es = await db.get(ExamSubject, exam_subject_id)
+    if es is None or es.exam_id != exam_id:
+        raise HTTPException(404, "Exam subject not found")
+
+    school = (await db.execute(select(_School).where(_School.id == school_id))).scalar_one_or_none()
+    if school is None:
+        raise HTTPException(404, "School not found")
+
+    subject = (await db.execute(select(_Subject).where(_Subject.id == es.subject_id))).scalar_one_or_none()
+
+    # Total possible marks for this paper
+    total_possible = es.total_marks_theory1
+    if paper_type == PaperType.THEORY2:
+        total_possible = es.total_marks_theory2
+    elif paper_type == PaperType.PRACTICAL:
+        total_possible = es.total_marks_practical
+
+    # Get questions if item-level
+    questions = []
+    q_rows = (await db.execute(
+        select(Question)
+        .where(Question.exam_subject_id == exam_subject_id, Question.paper_type == paper_type)
+        .order_by(Question.question_number)
+    )).scalars().all()
+    if q_rows:
+        questions = [{"number": str(q.question_number), "max_marks": float(q.max_marks)} for q in q_rows]
+
+    # Get students for this scope
+    students_q = (await db.execute(
+        select(ExamStudent, ExamStudentSubject)
+        .join(ExamStudentSubject, ExamStudentSubject.exam_student_id == ExamStudent.id)
+        .where(
+            ExamStudent.exam_id == exam_id,
+            ExamStudent.school_id == school_id,
+            ExamStudentSubject.exam_subject_id == exam_subject_id,
+        )
+        .order_by(ExamStudent.student_id)
+    )).all()
+
+    out_students = []
+    for student, ess in students_q:
+        # Attendance
+        att = (await db.execute(
+            select(Attendance).where(
+                Attendance.exam_student_subject_id == ess.id,
+                Attendance.paper_type.in_([paper_type, PaperType.ALL]),
+            )
+        )).scalars().all()
+        from ..services.attendance import resolve_effective_attendance
+        is_present = await resolve_effective_attendance(db, ess.id, paper_type)
+
+        # Total marks
+        tm = (await db.execute(
+            select(TotalMark).where(
+                TotalMark.exam_student_subject_id == ess.id,
+                TotalMark.paper_type == paper_type,
+            )
+        )).scalar_one_or_none()
+
+        # Item marks (if questions exist)
+        item_marks_dict = None
+        if questions:
+            im_rows = (await db.execute(
+                select(ItemMark).where(ItemMark.exam_student_subject_id == ess.id)
+            )).scalars().all()
+            item_marks_dict = {str(im.question_id): float(im.marks_obtained) if im.marks_obtained is not None else None for im in im_rows}
+            # Map question_id to question_number
+            q_id_to_num = {q.id: str(q.question_number) for q in q_rows}
+            item_marks_dict = {q_id_to_num.get(int(k), k): v for k, v in item_marks_dict.items()}
+
+        out_students.append({
             "student_id": student.student_id,
             "full_name": student.full_name,
-            "attendance": present, "has_marks": has_marks, "total": total,
+            "attendance": is_present,
+            "total_marks": float(tm.total_marks_obtained) if tm and tm.total_marks_obtained is not None else None,
+            "item_marks": item_marks_dict,
         })
-    return {"mode": mode, "students": out}
+
+    # Get enterer info (who finalized this scope)
+    finalized_row = (await db.execute(
+        select(FinalizedScope).where(
+            FinalizedScope.exam_id == exam_id,
+            FinalizedScope.school_id == school_id,
+            FinalizedScope.exam_subject_id == exam_subject_id,
+            FinalizedScope.paper_type == paper_type,
+        )
+    )).scalar_one_or_none()
+
+    enterer_initials = None
+    finalized_at = None
+    if finalized_row:
+        finalized_at = finalized_row.created_at.isoformat() if finalized_row.created_at else None
+
+    return {
+        "exam_name": exam.name,
+        "school_name": school.name,
+        "centre_number": school.centre_number,
+        "subject_code": subject.code if subject else str(exam_subject_id),
+        "subject_name": subject.name if subject else "",
+        "paper_type": paper_type.value,
+        "total_possible": total_possible,
+        "enterer_initials": enterer_initials,
+        "finalized_at": finalized_at,
+        "questions": questions if questions else None,
+        "students": out_students,
+    }
 
 
 @router.get("/{exam_id}/scopes/validation")

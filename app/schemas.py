@@ -99,6 +99,9 @@ class SchoolOut(ORMModel):
     centre_number: str
     name: str
     school_type: SchoolType
+    is_primary: bool
+    is_olevel: bool
+    is_alevel: bool
     region_id: int | None
     council_id: int | None
     ward_id: int | None

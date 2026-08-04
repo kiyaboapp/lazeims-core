@@ -49,12 +49,27 @@ class Station(Base, TimestampMixin):
     exam_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False, index=True)
     station_code: Mapped[str] = mapped_column(String(60), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
+    scope_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)  # 'LOCATION' or 'SCHOOLS'
     region_id: Mapped[int | None] = mapped_column(ForeignKey("regions.id"), nullable=True)
     council_id: Mapped[int | None] = mapped_column(ForeignKey("councils.id"), nullable=True)
+    ward_id: Mapped[int | None] = mapped_column(ForeignKey("wards.id"), nullable=True)
     managed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     sync_key_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     software_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class StationSchool(Base, TimestampMixin):
+    """Association table: which schools are explicitly assigned to a station (SCHOOLS scope mode)."""
+
+    __tablename__ = "station_schools"
+    __table_args__ = (
+        UniqueConstraint("station_id", "school_id", name="uq_station_schools_station_school"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    station_id: Mapped[int] = mapped_column(ForeignKey("stations.id", ondelete="CASCADE"), nullable=False, index=True)
+    school_id: Mapped[int] = mapped_column(ForeignKey("schools.id"), nullable=False, index=True)
 
 
 class ExamRoleAssignment(Base, TimestampMixin):

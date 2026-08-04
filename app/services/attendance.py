@@ -57,36 +57,46 @@ async def upsert_attendance(
     is_present: bool,
     source: AttendanceSource,
     actor_id: int | None,
+    station_occurred_at: str | None = None,
 ) -> Attendance:
     """Insert/update the attendance row for a specific paper (or ALL baseline).
 
     A Data Enterer confirming a specific paper always writes the ``paper_type=X``
     row — never the ALL baseline (enforced by the caller passing the real paper).
+
+    Uses INSERT ... ON CONFLICT DO UPDATE to avoid race conditions when multiple
+    concurrent requests target the same (exam_student_subject_id, paper_type).
     """
-    existing = (
-        await db.execute(
-            select(Attendance).where(
-                Attendance.exam_student_subject_id == exam_student_subject_id,
-                Attendance.paper_type == paper_type,
-            )
-        )
-    ).scalar_one_or_none()
-    now = datetime.now(timezone.utc)
-    if existing is None:
-        row = Attendance(
-            exam_student_subject_id=exam_student_subject_id,
-            paper_type=paper_type,
-            is_present=is_present,
-            source=source,
-            transcribed_by=actor_id,
-            transcribed_at=now,
-        )
-        db.add(row)
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    # Use station_occurred_at as the authoritative transcribed_at (Blueprint §8.4)
+    if station_occurred_at:
+        try:
+            transcribed_at = datetime.fromisoformat(station_occurred_at)
+        except (ValueError, TypeError):
+            transcribed_at = datetime.now(timezone.utc)
     else:
-        row = existing
-        row.is_present = is_present
-        row.source = source
-        row.transcribed_by = actor_id
-        row.transcribed_at = now
-    await db.flush()
+        transcribed_at = datetime.now(timezone.utc)
+
+    stmt = pg_insert(Attendance).values(
+        exam_student_subject_id=exam_student_subject_id,
+        paper_type=paper_type,
+        is_present=is_present,
+        source=source,
+        transcribed_by=actor_id,
+        transcribed_at=transcribed_at,
+        station_occurred_at=transcribed_at if station_occurred_at else None,
+    ).on_conflict_do_update(
+        constraint="uq_attendance_ess_paper",
+        set_={
+            "is_present": is_present,
+            "source": source,
+            "transcribed_by": actor_id,
+            "transcribed_at": transcribed_at,
+            "station_occurred_at": transcribed_at if station_occurred_at else None,
+        },
+    ).returning(Attendance)
+
+    result = await db.execute(stmt)
+    row = result.scalar_one()
     return row

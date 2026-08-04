@@ -115,12 +115,20 @@ async def main():
                         if row:
                             ward_db_ids[ward_key] = row["id"]
 
-                # School type - PRIVATE or UNKNOWN (no "public/government" default)
+                # School type - GOVERNMENT or PRIVATE from API
                 api_type = s.get("school_type", "")
                 if api_type == "PRIVATE":
                     school_type = "PRIVATE"
+                elif api_type == "GOVERNMENT":
+                    school_type = "GOVERNMENT"
                 else:
                     school_type = "UNKNOWN"
+
+                # Level flags from level_label
+                level_label = s.get("level_label", "")
+                is_primary = level_label == "MSINGI"
+                is_olevel = level_label in ("KIDATO CHA 1-4", "KIDATO CHA 1-6")
+                is_alevel = level_label in ("KIDATO CHA 1-6", "KIDATO CHA 5-6")
 
                 # Insert school
                 council_id = council_db_ids.get(council_name)
@@ -130,9 +138,10 @@ async def main():
                     continue
                 try:
                     await conn.execute(
-                        """INSERT INTO schools (centre_number, name, school_type, region_id, council_id, ward_id, can_download_template, created_at, updated_at)
-                           VALUES ($1, $2, $3, $4, $5, $6, false, NOW(), NOW())""",
+                        """INSERT INTO schools (centre_number, name, school_type, is_primary, is_olevel, is_alevel, region_id, council_id, ward_id, can_download_template, created_at, updated_at)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, NOW(), NOW())""",
                         centre, s["school_name"], school_type,
+                        is_primary, is_olevel, is_alevel,
                         region_db_ids[region_name], council_id, ward_id,
                     )
                     schools_inserted += 1

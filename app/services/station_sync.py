@@ -18,7 +18,7 @@ import uuid
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lazeims_common.enums import (
@@ -41,7 +41,7 @@ from ..models.station import StationPackage, SyncEventReceipt
 from .attendance import upsert_attendance
 from .finalize import finalize_scope
 from .marks_apply import apply_student_paper_marks
-from .scope_assignment import ResolvedStudentScope, enforce_writer_mode, is_scope_finalized
+from .scope_assignment import ResolvedStudentScope, is_scope_finalized
 
 
 async def _resolve_by_codes(db, exam_id, student_id, subject_code) -> ResolvedStudentScope:
@@ -98,34 +98,47 @@ async def _apply_event(db, *, exam_id: uuid.UUID, station_id: int, event: dict) 
     if etype == "ATTENDANCE_TRANSCRIBED":
         paper = PaperType(nk["paper_type"])
         scope = await _resolve_by_codes(db, exam_id, nk["student_id"], nk["subject_code"])
-        await enforce_writer_mode(db, exam_id=exam_id, school_id=scope.student.school_id,
-                                  exam_subject_id=scope.exam_subject.id, paper_type=paper,
-                                  expected_mode=WriterMode.STATION, station_id=station_id)
         if await is_scope_finalized(db, exam_id=exam_id, school_id=scope.student.school_id,
                                     exam_subject_id=scope.exam_subject.id, paper_type=paper):
             raise ValidationError(RejectionCode.SCOPE_ALREADY_FINALIZED, "Scope is finalized.")
+        station_occurred_at = event.get("occurred_at")
+        # Prevent marking absent if marks already exist
+        if not bool(value["is_present"]):
+            from ..models.marks import TotalMark
+            has_marks = (await db.execute(
+                select(func.count()).where(
+                    TotalMark.exam_student_subject_id == scope.exam_student_subject.id,
+                    TotalMark.paper_type == paper,
+                )
+            )).scalar_one()
+            if has_marks > 0:
+                raise ValidationError(RejectionCode.SCOPE_ALREADY_FINALIZED,
+                                      "Cannot mark absent — marks already entered.")
         await upsert_attendance(db, exam_student_subject_id=scope.exam_student_subject.id,
                                 paper_type=paper, is_present=bool(value["is_present"]),
                                 source=AttendanceSource(value.get("source", "INVIGILATOR_ISAL_TRANSCRIPTION")),
-                                actor_id=None)
+                                actor_id=None,
+                                station_occurred_at=station_occurred_at)
 
     elif etype == "STUDENT_PAPER_MARKS_REPLACED":
         paper = PaperType(nk["paper_type"])
         scope = await _resolve_by_codes(db, exam_id, nk["student_id"], nk["subject_code"])
-        await enforce_writer_mode(db, exam_id=exam_id, school_id=scope.student.school_id,
-                                  exam_subject_id=scope.exam_subject.id, paper_type=paper,
-                                  expected_mode=WriterMode.STATION, station_id=station_id)
         if await is_scope_finalized(db, exam_id=exam_id, school_id=scope.student.school_id,
                                     exam_subject_id=scope.exam_subject.id, paper_type=paper):
             raise ValidationError(RejectionCode.SCOPE_ALREADY_FINALIZED, "Scope is finalized.")
         mode = FillingMode(value["mode"])
         total = value.get("total")
         items = value.get("items")
+        station_occurred_at = event.get("occurred_at")
         await apply_student_paper_marks(
             db, scope=scope, paper_type=paper, mode=mode,
             total_marks_obtained=(None if total in (None, "") else total),
             items={k: v for k, v in (items or {}).items()} if mode == FillingMode.ITEM_LEVEL else None,
             actor_id=None,
+            station_occurred_at=station_occurred_at,
+            station_id=station_id,
+            sync_event_id=event.get("event_id"),
+            actor_assignment_id=int(event.get("actor_assignment_id") or 0) or None,
         )
 
     elif etype == "INCIDENT_RAISED":
@@ -152,9 +165,6 @@ async def _apply_event(db, *, exam_id: uuid.UUID, station_id: int, event: dict) 
         school = await _school_by_centre(db, nk["centre_number"])
         es = await _exam_subject_by_code(db, exam_id, nk["subject_code"])
         exam = await db.get(Exam, exam_id)
-        await enforce_writer_mode(db, exam_id=exam_id, school_id=school.id,
-                                  exam_subject_id=es.id, paper_type=paper,
-                                  expected_mode=WriterMode.STATION, station_id=station_id)
         finalized, result = await finalize_scope(
             db, exam=exam, school_id=school.id, exam_subject=es, paper_type=paper,
             writer_mode=WriterMode.STATION, finalized_by=None)

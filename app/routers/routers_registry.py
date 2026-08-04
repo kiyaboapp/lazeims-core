@@ -407,17 +407,14 @@ async def list_schools(
     if school_type:
         stmt = stmt.where(School.school_type == school_type)
 
-    # Resolve an exam level into the school level that sits it.
+    # Resolve an exam level into the school level flag.
     level = (school_level or "").upper() or None
     if level is None and exam_level:
         level = _EXAM_LEVEL_TO_SCHOOL_LEVEL.get(exam_level.upper())
     if level == "PRIMARY":
-        stmt = stmt.where(School.centre_number.ilike("PS%"))
+        stmt = stmt.where(School.is_primary == True)
     elif level == "SECONDARY":
-        # 'S…' but never 'PS…' — the PS prefix is primary.
-        stmt = stmt.where(
-            School.centre_number.ilike("S%") & ~School.centre_number.ilike("PS%")
-        )
+        stmt = stmt.where(School.is_olevel == True)
 
     if search:
         stmt = stmt.where(

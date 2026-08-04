@@ -411,7 +411,7 @@ async def list_exam_schools(exam_id: uuid.UUID, db: AsyncSession = Depends(get_s
     Returns the school name/centre inline so the client never has to bulk-load
     the whole school registry just to render this list.
     """
-    from ..models.registry import School as _School
+    from ..models.registry import School as _School, Council as _Council, Region as _Region
 
     rows = (
         await db.execute(
@@ -420,8 +420,15 @@ async def list_exam_schools(exam_id: uuid.UUID, db: AsyncSession = Depends(get_s
                 ExamSchool.school_id,
                 _School.name,
                 _School.centre_number,
+                _School.school_type,
+                _School.region_id,
+                _Region.name.label("region_name"),
+                _School.council_id,
+                _Council.name.label("council_name"),
             )
             .join(_School, _School.id == ExamSchool.school_id)
+            .outerjoin(_Region, _Region.id == _School.region_id)
+            .outerjoin(_Council, _Council.id == _School.council_id)
             .where(ExamSchool.exam_id == exam_id)
             .order_by(_School.centre_number)
         )
@@ -432,6 +439,11 @@ async def list_exam_schools(exam_id: uuid.UUID, db: AsyncSession = Depends(get_s
             "school_id": r.school_id,
             "school_name": r.name,
             "centre_number": r.centre_number,
+            "school_type": r.school_type.value if r.school_type else None,
+            "region_id": r.region_id,
+            "region_name": r.region_name,
+            "council_id": r.council_id,
+            "council_name": r.council_name,
         }
         for r in rows
     ]
@@ -493,11 +505,11 @@ async def bulk_enroll_schools(
     level = await db.get(_ExamLevel, exam.level_id)
     level_name = (level.name or "").upper() if level else ""
     if level_name in ("SFNA", "PSLE"):
-        stmt = stmt.where(_School.centre_number.ilike("PS%"))
-    elif level_name in ("FTNA", "CSEE", "ACSEE"):
-        stmt = stmt.where(
-            _School.centre_number.ilike("S%") & ~_School.centre_number.ilike("PS%")
-        )
+        stmt = stmt.where(_School.is_primary == True)
+    elif level_name in ("FTNA", "CSEE"):
+        stmt = stmt.where(_School.is_olevel == True)
+    elif level_name == "ACSEE":
+        stmt = stmt.where(_School.is_alevel == True)
 
     if payload.school_type:
         stmt = stmt.where(_School.school_type == payload.school_type)

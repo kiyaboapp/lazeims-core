@@ -18,6 +18,7 @@ from sqlalchemy import (
     DateTime,
     Enum as SAEnum,
     ForeignKey,
+    Index,
     Numeric,
     String,
     UniqueConstraint,
@@ -55,6 +56,7 @@ class Attendance(Base, TimestampMixin):
     source: Mapped[AttendanceSource] = mapped_column(_enum(AttendanceSource, "attendance_source", 60), nullable=False)
     transcribed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     transcribed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    station_occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ExamIncident(Base, TimestampMixin):
@@ -96,6 +98,7 @@ class TotalMark(Base, TimestampMixin):
     total_marks_obtained: Mapped[float] = mapped_column(Numeric(7, 2), nullable=False)  # never null
     entered_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     entered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    station_occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ItemMark(Base, TimestampMixin):
@@ -112,6 +115,7 @@ class ItemMark(Base, TimestampMixin):
     marks_obtained: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False)  # never null
     entered_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     entered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    station_occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class MarkBatchReceipt(Base, TimestampMixin):
@@ -126,3 +130,41 @@ class MarkBatchReceipt(Base, TimestampMixin):
     actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     payload_hash: Mapped[str] = mapped_column(String(80), nullable=False)
     result_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+
+class MarksAudit(Base):
+    """Immutable append-only audit trail for marks changes (Blueprint §9)."""
+
+    __tablename__ = "marks_audit"
+    __table_args__ = (
+        Index("idx_marks_audit_ess", "exam_student_subject_id", "paper_type"),
+        Index("idx_marks_audit_event", "sync_event_id"),
+        Index("idx_marks_audit_exam", "exam_id", "station_occurred_at"),
+        Index("idx_marks_audit_station", "station_id", "station_occurred_at"),
+        {"comment": "Immutable marks change history — never UPDATE or DELETE rows."},
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    exam_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("exams.id"), nullable=False, index=True
+    )
+    exam_student_subject_id: Mapped[int] = mapped_column(
+        ForeignKey("exam_student_subjects.id"), nullable=False
+    )
+    paper_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    operation: Mapped[str] = mapped_column(String(20), nullable=False)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    before_total: Mapped[float | None] = mapped_column(Numeric(7, 2), nullable=True)
+    before_items: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    after_total: Mapped[float | None] = mapped_column(Numeric(7, 2), nullable=True)
+    after_items: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    station_id: Mapped[int | None] = mapped_column(ForeignKey("stations.id"), nullable=True)
+    station_occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    central_received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default="now()"
+    )
+    sync_event_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    actor_assignment_id: Mapped[int | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default="now()"
+    )

@@ -32,7 +32,7 @@ from ..models.excel import ExcelImportBatch, ExcelImportRow, ExcelWorkbook
 from ..models.registry import School, Subject
 from .attendance import upsert_attendance
 from .marks_apply import apply_student_paper_marks, build_paper_config
-from .scope_assignment import enforce_writer_mode, is_scope_finalized, resolve_student_scope
+from .scope_assignment import is_scope_finalized, resolve_student_scope
 
 META_SHEET = "_meta"
 HEADER = ["student_id", "name", "present", "total"]
@@ -272,10 +272,6 @@ async def confirm_import(db: AsyncSession, *, batch: ExcelImportBatch, confirmed
         scope = await resolve_student_scope(
             db, exam_id=exam.id, student_id=row.student_id,
             exam_subject_id=(await _exam_subject_id(db, exam.id, row.subject_code)))
-        # EXCEL writer channel must own the scope.
-        await enforce_writer_mode(db, exam_id=exam.id, school_id=scope.student.school_id,
-                                  exam_subject_id=scope.exam_subject.id, paper_type=paper,
-                                  expected_mode=WriterMode.EXCEL)
         if await is_scope_finalized(db, exam_id=exam.id, school_id=scope.student.school_id,
                                     exam_subject_id=scope.exam_subject.id, paper_type=paper):
             continue

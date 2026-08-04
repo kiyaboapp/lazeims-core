@@ -18,6 +18,7 @@ from sqlalchemy import (
     Date,
     Enum as SAEnum,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -100,6 +101,7 @@ class ExamStudent(Base, TimestampMixin):
     __table_args__ = (
         # student_id is unique WITHIN an exam only (never cross-exam identity).
         UniqueConstraint("exam_id", "student_id", name="uq_exam_students_exam_id_student_id"),
+        Index("ix_exam_students_exam_school", "exam_id", "school_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -126,6 +128,7 @@ class ExamStudentSubject(Base, TimestampMixin):
             "exam_student_id", "exam_subject_id",
             name="uq_exam_student_subjects_student_subject",
         ),
+        Index("ix_ess_subject_student", "exam_subject_id", "exam_student_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

@@ -14,7 +14,20 @@ class StationIn(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     region_id: int | None = None
     council_id: int | None = None
+    ward_id: int | None = None
+    scope_mode: str | None = None  # 'LOCATION' or 'SCHOOLS'
+    school_ids: list[int] | None = None
     managed_by: int | None = None
+
+
+class StationScopeIn(BaseModel):
+    """PATCH payload for updating a station's scope."""
+    model_config = ConfigDict(extra="forbid")
+    scope_mode: str = Field(pattern="^(LOCATION|SCHOOLS)$")
+    region_id: int | None = None
+    council_id: int | None = None
+    ward_id: int | None = None
+    school_ids: list[int] | None = None
 
 
 class StationOut(BaseModel):
@@ -23,8 +36,11 @@ class StationOut(BaseModel):
     exam_id: uuid.UUID
     station_code: str
     name: str
+    scope_mode: str | None
     region_id: int | None
     council_id: int | None
+    ward_id: int | None
+    school_ids: list[int] | None = None
     is_active: bool
     software_version: str | None
 

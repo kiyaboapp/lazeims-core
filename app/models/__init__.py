@@ -12,6 +12,7 @@ from .assignments import (
     ScopeWriteAssignment,
     Station,
     StationCredential,
+    StationSchool,
 )
 from .exam import (
     Exam,
@@ -37,6 +38,7 @@ from .marks import (
     ExamIncident,
     ItemMark,
     MarkBatchReceipt,
+    MarksAudit,
     TotalMark,
 )
 from .registry import (
@@ -73,7 +75,7 @@ __all__ = [
     # exam core
     "Exam", "ExamSchool", "ExamSubject", "ExamStudent", "ExamStudentSubject",
     # attendance / marks
-    "Attendance", "ExamIncident", "TotalMark", "ItemMark", "MarkBatchReceipt",
+    "Attendance", "ExamIncident", "TotalMark", "ItemMark", "MarkBatchReceipt", "MarksAudit",
     # excel
     "ExcelWorkbook", "ExcelImportBatch", "ExcelImportRow",
     # collection closeout / export
@@ -85,7 +87,7 @@ __all__ = [
     # scoring
     "QuestionGroup", "Question", "QuestionTopic", "ExamConfigurationVersion",
     # assignments / scope
-    "Station", "ExamRoleAssignment", "DataEntererScope", "ScopeWriteAssignment",
+    "Station", "StationSchool", "ExamRoleAssignment", "DataEntererScope", "ScopeWriteAssignment",
     "StationCredential", "FinalizedScope", "ScopeRevision",
     # station domain
     "StationPackage", "StationMachineCredential", "SyncEventReceipt",
