@@ -775,7 +775,6 @@ async def seed_default_subjects(
     try:
         level = await db.get(_ExamLevel, exam.level_id)
         level_name = (level.name or "").upper() if level else ""
-        settings = get_settings()
         subjects = await build_subjects_payload(db, exam)
         filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
         from ..models.processing import ExamProcessingLink
@@ -790,7 +789,7 @@ async def seed_default_subjects(
                 external_ref=str(exam.id),
                 name=exam.name,
                 level=level_name,
-                zone_name=settings.zone_name.strip() or None,
+                zone_name=None,
                 filling_mode=filling_mode,
                 subjects=subjects,
             )
@@ -846,7 +845,6 @@ async def patch_exam_subject(
     try:
         level = await db.get(ExamLevel, exam.level_id)
         level_name = (level.name if level else "").upper()
-        settings = get_settings()
         subjects = await build_subjects_payload(db, exam)
         filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
         # Need to get the link's api_key - pull the processing link
@@ -862,7 +860,7 @@ async def patch_exam_subject(
                 external_ref=str(exam.id),
                 name=exam.name,
                 level=level_name,
-                zone_name=settings.zone_name.strip() or None,
+                zone_name=None,
                 filling_mode=filling_mode,
                 subjects=subjects,
             )

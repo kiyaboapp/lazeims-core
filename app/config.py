@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     @property
     def provisioning_enabled(self) -> bool:
         """True when Central can obtain exam keys by itself."""
-        return self.processing_enabled and bool(self.backend_sis_provision_secret.strip())
+        return self.processing_enabled
 
     session_cookie_name: str = "lazeims_session"
     session_ttl_seconds: int = 43_200

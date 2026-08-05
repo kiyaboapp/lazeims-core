@@ -223,8 +223,8 @@ async def test_second_call_is_a_no_op_and_rotate_reissues(client, monkeypatch):
 async def test_access_key_503_when_provisioning_disabled(client, monkeypatch):
     h = await _admin(client)
     exam_id = await _create_exam(client, h)
-    # Base URL configured but no enrolment secret: processing works, issuance does not.
-    monkeypatch.setenv("BACKEND_SIS_BASE_URL", "http://fake-exametrics.test")
+    # No base URL configured: provisioning is disabled entirely.
+    monkeypatch.setenv("BACKEND_SIS_BASE_URL", "")
     monkeypatch.setenv("BACKEND_SIS_PROVISION_SECRET", "")
     from app.config import get_settings
 
