@@ -68,16 +68,15 @@ async def _provision_payload(db: AsyncSession, exam: Exam, user: User) -> dict:
     level = await db.get(ExamLevel, exam.level_id)
     board = await db.get(Board, exam.board_id) if exam.board_id else None
     settings = get_settings()
-    zone = settings.zone_name.strip()
     payload = {
         "external_exam_id": str(exam.id),
         "exam_name": exam.name,
         "exam_level": (level.name if level else "").upper(),
-        "board_name": (board.name if board else None) or zone or None,
+        "board_name": (board.name if board else None),
         "start_date": exam.start_date.isoformat() if exam.start_date else None,
         "end_date": exam.end_date.isoformat() if exam.end_date else None,
         "scopes": list(REQUESTED_SCOPES),
-        "partner_label": (zone or "LAZEIMS")[:60],
+        "partner_label": "LAZEIMS",
         "requested_by": _requester_payload(user),
     }
     # Include callback_url for webhook notifications (processing state changes)
@@ -241,7 +240,7 @@ async def ensure_access_key(
             external_ref=str(exam.id),
             name=exam.name,
             level=level_name,
-            zone_name=settings.zone_name.strip() or None,
+            zone_name=None,
             filling_mode=filling_mode,
             subjects=subjects,
         )

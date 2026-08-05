@@ -67,17 +67,20 @@ def _client(api_key: str) -> httpx.AsyncClient:
 
 
 def _provision_client() -> httpx.AsyncClient:
-    """Client for key issuance, authenticated by the zone enrolment secret.
+    """Client for key issuance.
 
-    Deliberately carries no ``X-API-Key``: this is how Central obtains one in the
-    first place.
+    No longer requires backend_sis_provision_secret: requests are authenticated
+    by an Ed25519 signature of the payload (X-Provision-Signature header). If the
+    legacy provision secret is configured, it is still sent as X-Provision-Secret
+    for backward compatibility with older backend-sis deployments.
     """
+    headers: dict[str, str] = {}
     secret = get_settings().backend_sis_provision_secret.strip()
-    if not secret:
-        raise BackendSisError("Key provisioning is not configured (backend_sis_provision_secret is empty).")
+    if secret:
+        headers["X-Provision-Secret"] = secret
     return httpx.AsyncClient(
         base_url=_base_url(),
-        headers={"X-Provision-Secret": secret},
+        headers=headers,
         timeout=get_settings().backend_sis_timeout_seconds,
     )
 
@@ -154,9 +157,19 @@ async def provision_exam(payload: dict) -> dict:
     Server-to-server: the response carries the secret exactly once, so it is
     stored on the exam's :class:`ExamProcessingLink` and never returned to a
     browser or written to an audit record.
+
+    Authentication is via Ed25519 signature of the payload (X-Provision-Signature
+    header). The legacy X-Provision-Secret is also sent if configured.
     """
+    from lazeims_common.signing import sign_provision_request
+
+    signature = sign_provision_request(payload)
     async with _provision_client() as client:
-        resp = await client.post("/integration/provision", json=payload)
+        resp = await client.post(
+            "/integration/provision",
+            json=payload,
+            headers={"X-Provision-Signature": signature},
+        )
         return _unwrap(resp) or {}
 
 

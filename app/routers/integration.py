@@ -184,7 +184,7 @@ async def request_access_key(
                 "code": PROVISIONING_DISABLED,
                 "message": (
                     "This deployment cannot request ExaMetrics keys automatically "
-                    "(no provisioning secret is configured)."
+                    "(no ExaMetrics base URL is configured)."
                 ),
             },
         )
@@ -308,7 +308,6 @@ async def submit_for_processing(
     try:
         level = await db.get(ExamLevel, exam.level_id)
         level_name = (level.name if level else "").upper()
-        settings = get_settings()
         subjects = await build_subjects_payload(db, exam)
         filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
         await backend_sis.upsert_exam_definition(
@@ -316,7 +315,7 @@ async def submit_for_processing(
             external_ref=str(exam.id),
             name=exam.name,
             level=level_name,
-            zone_name=settings.zone_name.strip() or None,
+            zone_name=None,
             filling_mode=filling_mode,
             subjects=subjects,
         )
