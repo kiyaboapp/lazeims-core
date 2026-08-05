@@ -113,9 +113,9 @@ async def build_collection_payload(db: AsyncSession, exam: Exam) -> dict:
         {
             "student_id": sid,
             "centre_number": cn,
-            "first_name": fn,
-            "middle_name": mn,
-            "surname": sn,
+            "first_name": (fn or "").upper(),
+            "middle_name": mn.upper() if mn else None,
+            "surname": (sn or "").upper(),
             "sex": sex.value if hasattr(sex, "value") else sex,
         }
         for sid, cn, fn, mn, sn, sex in student_rows
@@ -192,11 +192,34 @@ async def build_collection_payload(db: AsyncSession, exam: Exam) -> dict:
         if sat_field:
             entry[sat_field] = bool(present)
 
+    # Filter out marks entries with no actual data (bare registrations)
+    # AND marks that ExaMetrics will reject (sat=True but no corresponding marks value).
+    _MARK_FIELDS = frozenset(("theory_marks", "theory_2_marks", "practical_marks"))
+    _SAT_FIELDS = frozenset(("sat_theory", "sat_theory_2", "sat_practical"))
+    _SAT_TO_MARK = {
+        "sat_theory": "theory_marks",
+        "sat_theory_2": "theory_2_marks",
+        "sat_practical": "practical_marks",
+    }
+
+    def _is_valid_mark(m: dict) -> bool:
+        has_any_mark = any(m.get(k) is not None for k in _MARK_FIELDS)
+        has_any_sat = any(m.get(k) is not None for k in _SAT_FIELDS)
+        if not has_any_mark and not has_any_sat:
+            return False  # empty registration row
+        # Reject if sat=True but no corresponding marks value
+        for sat_field, mark_field in _SAT_TO_MARK.items():
+            if m.get(sat_field) is True and m.get(mark_field) is None:
+                return False
+        return True
+
+    marks_with_data = [m for m in marks.values() if _is_valid_mark(m)]
+
     return {
         "schools": schools,
         "subjects": subjects,
         "students": students,
-        "marks": list(marks.values()),
+        "marks": marks_with_data,
     }
 
 

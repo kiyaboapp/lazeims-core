@@ -103,6 +103,19 @@ async def _build_and_push(
 
     total = len(filtered_payloads)
     if total == 0:
+        # Nothing to push — reset status
+        from ..models.processing import ExamProcessingLink
+        from sqlalchemy import update as sa_update
+        try:
+            async with async_sessionmaker_factory()() as db:
+                await db.execute(
+                    sa_update(ExamProcessingLink)
+                    .where(ExamProcessingLink.exam_id == exam_uuid)
+                    .values(last_status="IDLE")
+                )
+                await db.commit()
+        except Exception:
+            pass
         return {
             "total_schools": 0, "completed": 0,
             "schools_done": [], "schools_failed": [],
@@ -116,7 +129,6 @@ async def _build_and_push(
     })
 
     digest = collection_digest(merge_chunks(filtered_payloads))
-    manifest = chunk_manifest(filtered_payloads)
 
     session_payload = {
         "chunk_count": total,
@@ -126,6 +138,8 @@ async def _build_and_push(
     session_id = session.get("session_id") or session.get("id", "")
 
     # Step 4: Upload one school per chunk
+    # ExaMetrics rate limit is 120 RPM. Pace at ~1 req/sec to stay well under.
+    _CHUNK_DELAY_SECS = 0.75
     schools_done: list[dict] = []
     schools_failed: list[dict] = []
 
@@ -143,8 +157,36 @@ async def _build_and_push(
             "schools_failed": schools_failed[:],
         })
 
-        try:
-            await backend_sis.put_chunk(api_key, session_id, i, chunk)
+        # Retry with exponential backoff on rate-limit / transient errors
+        max_retries = 5
+        success = False
+        for attempt in range(max_retries):
+            try:
+                await backend_sis.put_chunk(api_key, session_id, i, chunk)
+                success = True
+                break
+            except Exception as exc:
+                err_msg = str(exc).lower()
+                is_retryable = (
+                    "too many" in err_msg
+                    or "429" in err_msg
+                    or "503" in err_msg
+                    or "timeout" in err_msg
+                    or "unreachable" in err_msg
+                )
+                if is_retryable and attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
+                    logger.warning(
+                        "Retrying school %s (attempt %d/%d) after %ds: %s",
+                        cn, attempt + 1, max_retries, wait, exc,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error("Failed to push school %s: %s", cn, exc)
+                    schools_failed.append({"centre_number": cn, "name": school_name, "error": str(exc)})
+                    break
+
+        if success:
             schools_done.append({"centre_number": cn, "name": school_name})
 
             # Update push cache for this school
@@ -154,9 +196,9 @@ async def _build_and_push(
                     async with async_sessionmaker_factory()() as db:
                         await upsert_cache(db, exam_uuid, updates, task_id)
                         await db.commit()
-        except Exception as exc:
-            logger.error("Failed to push school %s: %s", cn, exc)
-            schools_failed.append({"centre_number": cn, "name": school_name, "error": str(exc)})
+
+            # Throttle to respect ExaMetrics rate limit
+            await asyncio.sleep(_CHUNK_DELAY_SECS)
 
     # Step 5: Complete session
     try:
@@ -164,6 +206,22 @@ async def _build_and_push(
         await backend_sis.complete_collection_session(api_key, session_id, complete_payload)
     except Exception as exc:
         logger.error("Failed to complete collection session: %s", exc)
+
+    # Step 6: Update processing link status
+    from ..models.processing import ExamProcessingLink
+    from sqlalchemy import update
+    from datetime import datetime, timezone
+    try:
+        async with async_sessionmaker_factory()() as db:
+            status = "PUSHED" if not schools_failed else "PUSH_PARTIAL"
+            await db.execute(
+                update(ExamProcessingLink)
+                .where(ExamProcessingLink.exam_id == exam_uuid)
+                .values(last_status=status, last_submitted_at=datetime.now(timezone.utc))
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.warning("Failed to update processing link status: %s", exc)
 
     return {
         "total_schools": total,

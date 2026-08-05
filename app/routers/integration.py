@@ -267,6 +267,33 @@ async def get_capabilities(
     }
 
 
+# ── Entitlements ─────────────────────────────────────────────────────────────
+@router.get("/{exam_id}/processing/entitlements")
+async def get_entitlements(
+    exam_id: uuid.UUID, db: AsyncSession = Depends(get_session), _: User = Depends(current_user)
+):
+    """Fetch entitlements from ExaMetrics for this exam."""
+    link = await _get_link(db, exam_id)
+    if link is None or not link.api_key_encrypted:
+        return {
+            "exam_ref": str(exam_id),
+            "closeout_revision": None,
+            "processing": {"state": "NONE", "reason": "NOT_CONFIGURED"},
+            "results": {"state": "LOCKED", "reason": "NOT_CONFIGURED"},
+        }
+    try:
+        from ..services import backend_sis
+        data = await backend_sis.get_entitlements(link.api_key, link.backend_exam_id)
+        return data
+    except Exception:
+        return {
+            "exam_ref": str(exam_id),
+            "closeout_revision": None,
+            "processing": {"state": "NONE", "reason": "UNAVAILABLE"},
+            "results": {"state": "LOCKED", "reason": "UNAVAILABLE"},
+        }
+
+
 # ── Submit for processing ────────────────────────────────────────────────────
 @router.post("/{exam_id}/processing/push")
 async def push_collection_data(
@@ -342,33 +369,77 @@ async def push_preview(
     Returns total enrolled schools, how many have been pushed before (cached),
     and how many are new. Lightweight — no full payload building.
     """
-    from sqlalchemy import func, distinct
+    from sqlalchemy import func, distinct, union
     from ..models.exam import ExamSchool, ExamStudent, ExamStudentSubject
-    from ..models.marks import TotalMark
     from ..models.push_cache import CollectionPushCache
     from ..models.registry import School
 
     await _get_exam(db, exam_id)
     link = await _get_link(db, exam_id)
-    if link is None or not link.configured:
+    if link is None or not link.api_key_encrypted:
         raise HTTPException(409, detail="Processing link not configured.")
 
-    # Count enrolled schools
-    total_schools = (await db.execute(
-        select(func.count()).select_from(ExamSchool).where(ExamSchool.exam_id == exam_id)
-    )).scalar() or 0
+    # Count schools that have any marks data (TotalMark, ItemMark, or Attendance)
+    # This matches what build_collection_payload actually sends.
+    from ..models.marks import TotalMark, ItemMark, Attendance
 
-    # Count students
-    total_students = (await db.execute(
-        select(func.count()).select_from(ExamStudent).where(ExamStudent.exam_id == exam_id)
-    )).scalar() or 0
-
-    # Count marks (total_marks rows)
-    total_marks = (await db.execute(
-        select(func.count()).select_from(TotalMark)
+    schools_with_total = (
+        select(distinct(ExamStudent.school_id))
+        .select_from(TotalMark)
         .join(ExamStudentSubject, ExamStudentSubject.id == TotalMark.exam_student_subject_id)
         .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
         .where(ExamStudent.exam_id == exam_id)
+    )
+    schools_with_item = (
+        select(distinct(ExamStudent.school_id))
+        .select_from(ItemMark)
+        .join(ExamStudentSubject, ExamStudentSubject.id == ItemMark.exam_student_subject_id)
+        .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
+        .where(ExamStudent.exam_id == exam_id)
+    )
+    schools_with_attendance = (
+        select(distinct(ExamStudent.school_id))
+        .select_from(Attendance)
+        .join(ExamStudentSubject, ExamStudentSubject.id == Attendance.exam_student_subject_id)
+        .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
+        .where(ExamStudent.exam_id == exam_id)
+    )
+    schools_with_data_subq = union(schools_with_total, schools_with_item, schools_with_attendance).subquery()
+
+    total_schools = (await db.execute(
+        select(func.count()).select_from(schools_with_data_subq)
+    )).scalar() or 0
+
+    # Count students in those schools (push sends all students in a school with data)
+    total_students = (await db.execute(
+        select(func.count())
+        .select_from(ExamStudent)
+        .where(ExamStudent.exam_id == exam_id, ExamStudent.school_id.in_(select(schools_with_data_subq)))
+    )).scalar() or 0
+
+    # Count marks rows that would be sent (student-subject pairs with any data)
+    # A marks row is sent when it has TotalMark, ItemMark, or Attendance data.
+    ess_with_total = (
+        select(distinct(TotalMark.exam_student_subject_id))
+        .join(ExamStudentSubject, ExamStudentSubject.id == TotalMark.exam_student_subject_id)
+        .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
+        .where(ExamStudent.exam_id == exam_id)
+    )
+    ess_with_item = (
+        select(distinct(ItemMark.exam_student_subject_id))
+        .join(ExamStudentSubject, ExamStudentSubject.id == ItemMark.exam_student_subject_id)
+        .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
+        .where(ExamStudent.exam_id == exam_id)
+    )
+    ess_with_att = (
+        select(distinct(Attendance.exam_student_subject_id))
+        .join(ExamStudentSubject, ExamStudentSubject.id == Attendance.exam_student_subject_id)
+        .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
+        .where(ExamStudent.exam_id == exam_id)
+    )
+    ess_with_data_subq = union(ess_with_total, ess_with_item, ess_with_att).subquery()
+    total_marks = (await db.execute(
+        select(func.count()).select_from(ess_with_data_subq)
     )).scalar() or 0
 
     # Count cached entries (already pushed)
