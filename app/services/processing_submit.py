@@ -252,6 +252,11 @@ async def build_school_payloads(
         marks_by_school[m["centre_number"]].append(m)
     
     payloads = []
+    # When skip_empty, only include subjects that appear in the marks we're pushing
+    if skip_empty:
+        used_codes = {m["subject_code"] for marks_list in marks_by_school.values() for m in marks_list}
+        subjects = [s for s in subjects if s["subject_code"] in used_codes]
+
     for i, school in enumerate(schools):
         cn = school["centre_number"]
         school_students = students_by_school.get(cn, [])

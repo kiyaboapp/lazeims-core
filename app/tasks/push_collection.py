@@ -55,14 +55,14 @@ async def _build_and_push(
         if not exam:
             return {"error": "Exam not found", "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": []}
 
-        # Sync exam definition (best-effort)
+        # Sync exam definition (best-effort). Subjects are NOT sent here —
+        # ExaMetrics seeds its own subjects based on exam level via factory data.
+        # Collection payload carries only the subjects that have actual marks.
         try:
-            from ..services.exametrics_provision import build_subjects_payload
-            from ..models.exam import ExamLevel
+            from ..models.registry import ExamLevel
             from ..config import get_settings
             level = await db.get(ExamLevel, exam.level_id)
             level_name = (level.name if level else "").upper()
-            subjects = await build_subjects_payload(db, exam)
             filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
             await backend_sis.upsert_exam_definition(
                 api_key,
@@ -71,7 +71,7 @@ async def _build_and_push(
                 level=level_name,
                 zone_name=get_settings().zone_name or None,
                 filling_mode=filling_mode,
-                subjects=subjects,
+                subjects=[],
             )
         except Exception as exc:
             logger.warning("Exam definition sync failed (non-fatal): %s", exc)
