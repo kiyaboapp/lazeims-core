@@ -198,3 +198,50 @@ async def build_collection_payload(db: AsyncSession, exam: Exam) -> dict:
         "students": students,
         "marks": list(marks.values()),
     }
+
+
+async def build_school_payloads(
+    db: AsyncSession, exam: Exam, *, skip_empty: bool = True
+) -> list[dict]:
+    """Build per-school chunk payloads for chunked upload.
+    
+    Each chunk contains one school + its students + its marks.
+    Chunk 0 also carries the full subjects list. Subsequent chunks have subjects=[].
+    
+    When skip_empty=True, schools with no students/marks are excluded (for daily sync).
+    When skip_empty=False, all enrolled schools are included (for submit-for-processing).
+    """
+    full_payload = await build_collection_payload(db, exam)
+    
+    schools = full_payload["schools"]
+    subjects = full_payload["subjects"]
+    all_students = full_payload["students"]
+    all_marks = full_payload["marks"]
+    
+    # Group students and marks by centre_number
+    from collections import defaultdict
+    students_by_school: dict[str, list] = defaultdict(list)
+    marks_by_school: dict[str, list] = defaultdict(list)
+    
+    for s in all_students:
+        students_by_school[s["centre_number"]].append(s)
+    for m in all_marks:
+        marks_by_school[m["centre_number"]].append(m)
+    
+    payloads = []
+    for i, school in enumerate(schools):
+        cn = school["centre_number"]
+        school_students = students_by_school.get(cn, [])
+        school_marks = marks_by_school.get(cn, [])
+        
+        if skip_empty and not school_marks:
+            continue
+        
+        payloads.append({
+            "schools": [school],
+            "subjects": subjects if len(payloads) == 0 else [],
+            "students": school_students,
+            "marks": school_marks,
+        })
+    
+    return payloads

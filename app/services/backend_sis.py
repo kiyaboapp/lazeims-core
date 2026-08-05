@@ -15,11 +15,12 @@ from __future__ import annotations
 import json
 import sys
 import uuid
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Optional
 
 import httpx
 
-from lazeims_common.exametrics_digest import chunk_manifest, chunk_payload, collection_digest
+from lazeims_common.exametrics_digest import chunk_payload, collection_digest
 
 from ..config import get_settings
 
@@ -85,6 +86,12 @@ def _provision_client() -> httpx.AsyncClient:
     )
 
 
+def _is_html(text: str) -> bool:
+    """Detect HTML responses (e.g. Cloudflare error pages)."""
+    stripped = text.strip()[:200].lower()
+    return stripped.startswith("<!doctype html") or stripped.startswith("<html")
+
+
 def _extract_error(resp: httpx.Response) -> BackendSisError:
     """Build a BackendSisError preserving the upstream code for known statuses (D9)."""
     try:
@@ -97,7 +104,12 @@ def _extract_error(resp: httpx.Response) -> BackendSisError:
     message: str = ""
     details: list | None = None
 
-    if isinstance(body, dict):
+    if isinstance(body, str) and _is_html(body):
+        # Cloudflare or similar proxy returned an HTML error page — don't
+        # surface raw HTML to callers or the frontend.
+        message = "The ExaMetrics server is not reachable. Please try again later."
+        code = "EXAMETRICS_UNREACHABLE"
+    elif isinstance(body, dict):
         detail = body.get("detail") or body.get("error")
         if isinstance(detail, dict):
             code = detail.get("code")
@@ -108,7 +120,7 @@ def _extract_error(resp: httpx.Response) -> BackendSisError:
         else:
             message = str(body)
     else:
-        message = str(body)
+        message = str(body) if body else "Unexpected response from ExaMetrics."
 
     if not code:
         code = "EXAMETRICS_ERROR"
@@ -128,7 +140,7 @@ def _extract_error(resp: httpx.Response) -> BackendSisError:
             message=f"ExaMetrics error: {message}",
             status_code=resp.status_code,
             payload=body,
-            code="EXAMETRICS_ERROR",
+            code=code if code != "EXAMETRICS_ERROR" else "EXAMETRICS_ERROR",
             details=details,
         )
 
@@ -144,9 +156,49 @@ def _unwrap(resp: httpx.Response) -> Any:
         return resp.content
 
 
+def _wrap_transport_error(exc: httpx.HTTPError) -> BackendSisError:
+    """Convert httpx transport/network errors into a clean BackendSisError."""
+    if isinstance(exc, httpx.TimeoutException):
+        return BackendSisError(
+            message="The ExaMetrics server did not respond in time. Please try again later.",
+            status_code=None,
+            code="EXAMETRICS_UNREACHABLE",
+        )
+    # ConnectError, ReadError, etc.
+    return BackendSisError(
+        message="The ExaMetrics server is not reachable. Please try again later.",
+        status_code=None,
+        code="EXAMETRICS_UNREACHABLE",
+    )
+
+
 def _idempotency_key() -> str:
     """Generate a unique idempotency key per section 7.1."""
     return str(uuid.uuid4())
+
+
+@asynccontextmanager
+async def _safe_client(api_key: str) -> AsyncIterator[httpx.AsyncClient]:
+    """Wrap _client with transport error handling."""
+    try:
+        async with _client(api_key) as client:
+            yield client
+    except BackendSisError:
+        raise
+    except httpx.HTTPError as exc:
+        raise _wrap_transport_error(exc) from exc
+
+
+@asynccontextmanager
+async def _safe_provision_client() -> AsyncIterator[httpx.AsyncClient]:
+    """Wrap _provision_client with transport error handling."""
+    try:
+        async with _provision_client() as client:
+            yield client
+    except BackendSisError:
+        raise
+    except httpx.HTTPError as exc:
+        raise _wrap_transport_error(exc) from exc
 
 
 # ---- Provisioning ----
@@ -164,7 +216,7 @@ async def provision_exam(payload: dict) -> dict:
     from lazeims_common.signing import sign_provision_request
 
     signature = sign_provision_request(payload)
-    async with _provision_client() as client:
+    async with _safe_provision_client() as client:
         resp = await client.post(
             "/integration/provision",
             json=payload,
@@ -177,7 +229,7 @@ async def provision_exam(payload: dict) -> dict:
 
 async def identity(api_key: str) -> dict:
     """Validate a key and fetch the exam account/capabilities via GET /integration/me."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.get("/integration/me")
         return _unwrap(resp)
 
@@ -186,7 +238,7 @@ async def identity(api_key: str) -> dict:
 
 async def upsert_exam(api_key: str, payload: dict) -> dict:
     """PUT /integration/exams - create or update exam configuration."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.put(
             "/integration/exams",
             json=payload,
@@ -225,7 +277,7 @@ async def upsert_exam_definition(
         "filling_mode": filling_mode,  # TOTAL_MARKS | ITEM_LEVEL
         "subjects": subjects,
     }
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.put(
             "/integration/exams",
             json=payload,
@@ -236,7 +288,7 @@ async def upsert_exam_definition(
 
 async def get_exam(api_key: str, exam_ref: str) -> dict:
     """GET /integration/exams/{ref} - retrieve exam details."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.get(f"/integration/exams/{exam_ref}")
         return _unwrap(resp) or {}
 
@@ -245,7 +297,7 @@ async def get_exam(api_key: str, exam_ref: str) -> dict:
 
 async def get_entitlements(api_key: str, exam_ref: str) -> dict:
     """GET /integration/exams/{ref}/entitlements - check what this key can do."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.get(f"/integration/exams/{exam_ref}/entitlements")
         return _unwrap(resp) or {}
 
@@ -254,7 +306,7 @@ async def get_entitlements(api_key: str, exam_ref: str) -> dict:
 
 async def request_processing(api_key: str, exam_ref: str, payload: dict) -> dict:
     """POST /integration/exams/{ref}/processing-requests - request processing approval."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.post(
             f"/integration/exams/{exam_ref}/processing-requests",
             json=payload,
@@ -265,7 +317,7 @@ async def request_processing(api_key: str, exam_ref: str, payload: dict) -> dict
 
 async def get_processing_request(api_key: str, exam_ref: str, request_id: str) -> dict:
     """GET /integration/exams/{ref}/processing-requests/{id} - poll request state."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.get(
             f"/integration/exams/{exam_ref}/processing-requests/{request_id}"
         )
@@ -276,7 +328,7 @@ async def get_processing_request(api_key: str, exam_ref: str, request_id: str) -
 
 async def push_collection(api_key: str, backend_exam_id: str, payload: dict) -> Any:
     """POST single-shot collection push."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.post(
             f"/integration/exams/{backend_exam_id}/collection",
             json=payload,
@@ -287,7 +339,7 @@ async def push_collection(api_key: str, backend_exam_id: str, payload: dict) -> 
 
 async def start_collection_session(api_key: str, exam_ref: str, payload: dict) -> dict:
     """POST /integration/exams/{ref}/collection-sessions - start chunked upload."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.post(
             f"/integration/exams/{exam_ref}/collection-sessions",
             json=payload,
@@ -298,7 +350,7 @@ async def start_collection_session(api_key: str, exam_ref: str, payload: dict) -
 
 async def put_chunk(api_key: str, session_id: str, chunk_number: int, chunk_data: dict) -> dict:
     """PUT /integration/collection-sessions/{id}/chunks/{n} - upload a chunk."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.put(
             f"/integration/collection-sessions/{session_id}/chunks/{chunk_number}",
             json=chunk_data,
@@ -308,7 +360,7 @@ async def put_chunk(api_key: str, session_id: str, chunk_number: int, chunk_data
 
 async def complete_collection_session(api_key: str, session_id: str, payload: dict) -> dict:
     """POST /integration/collection-sessions/{id}/complete - finalize chunked upload."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.post(
             f"/integration/collection-sessions/{session_id}/complete",
             json=payload,
@@ -341,9 +393,8 @@ async def push_collection_auto(api_key: str, exam_ref: str, payload: dict) -> An
     manifest = chunk_manifest(chunks)
 
     session_payload = {
-        "total_chunks": len(chunks),
-        "digest": digest,
-        "manifest": manifest,
+        "chunk_count": len(chunks),
+        "expected_digest": digest,
     }
     session = await start_collection_session(api_key, exam_ref, session_payload)
     session_id = session.get("session_id") or session.get("id", "")
@@ -359,7 +410,7 @@ async def push_collection_auto(api_key: str, exam_ref: str, payload: dict) -> An
 
 async def trigger_processing(api_key: str, backend_exam_id: str) -> Any:
     """POST /integration/exams/{ref}/process - trigger processing run."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.post(
             f"/integration/exams/{backend_exam_id}/process",
             headers={"Idempotency-Key": _idempotency_key()},
@@ -370,7 +421,7 @@ async def trigger_processing(api_key: str, backend_exam_id: str) -> Any:
 # ---- Status ----
 
 async def get_status(api_key: str, backend_exam_id: str) -> Any:
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.get(f"/integration/exams/{backend_exam_id}/status")
         return _unwrap(resp)
 
@@ -378,7 +429,7 @@ async def get_status(api_key: str, backend_exam_id: str) -> Any:
 # ---- Results ----
 
 async def get_results_stats(api_key: str, backend_exam_id: str) -> Any:
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.get(f"/integration/exams/{backend_exam_id}/results/stats")
         return _unwrap(resp)
 
@@ -386,7 +437,7 @@ async def get_results_stats(api_key: str, backend_exam_id: str) -> Any:
 async def download_school_pdf(
     api_key: str, backend_exam_id: str, centre_number: str, include_marks: bool = True
 ) -> tuple[bytes, str]:
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.get(
             f"/integration/exams/{backend_exam_id}/results/school/{centre_number}.pdf",
             params={"include_marks": include_marks},
@@ -400,7 +451,7 @@ async def download_rawdata(
     api_key: str, backend_exam_id: str, **params: Optional[str]
 ) -> tuple[bytes, str]:
     clean = {k: v for k, v in params.items() if v is not None}
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.get(
             f"/integration/exams/{backend_exam_id}/results/rawdata.xlsx", params=clean
         )
@@ -416,7 +467,7 @@ async def download_rawdata(
 
 async def extract_registrations(api_key: str, filename: str, content: bytes, content_type: str) -> Any:
     """Free PDF/ZIP -> rows extraction. Nothing is persisted in ExaMetrics."""
-    async with _client(api_key) as client:
+    async with _safe_client(api_key) as client:
         resp = await client.post(
             "/integration/registrations/extract",
             files={"file": (filename, content, content_type or "application/octet-stream")},

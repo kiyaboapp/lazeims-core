@@ -13,6 +13,9 @@ os.environ["DATABASE_URL"] = "postgresql+asyncpg://postgres:ma0zYn9RzAZbhBOE2Bs2
 os.environ.setdefault("SESSION_SECRET_KEY", "test-secret-key-0123456789")
 os.environ.setdefault("STATION_PACKAGE_INTEGRITY_KEY", "test-integrity-key-0123456789")
 os.environ.setdefault("APP_ENV", "development")
+# Never let tests hit the real ExaMetrics server. Tests that need provisioning
+# must explicitly set this via monkeypatch + mock the backend_sis calls.
+os.environ["BACKEND_SIS_BASE_URL"] = ""
 
 import pytest
 import pytest_asyncio

@@ -72,7 +72,7 @@ async def _provision_payload(db: AsyncSession, exam: Exam, user: User) -> dict:
         "external_exam_id": str(exam.id),
         "exam_name": exam.name,
         "exam_level": (level.name if level else "").upper(),
-        "board_name": (board.name if board else None),
+        "board_name": (board.name if board else settings.zone_name or None),
         "start_date": exam.start_date.isoformat() if exam.start_date else None,
         "end_date": exam.end_date.isoformat() if exam.end_date else None,
         "scopes": list(REQUESTED_SCOPES),
@@ -240,7 +240,7 @@ async def ensure_access_key(
             external_ref=str(exam.id),
             name=exam.name,
             level=level_name,
-            zone_name=None,
+            zone_name=get_settings().zone_name or None,
             filling_mode=filling_mode,
             subjects=subjects,
         )

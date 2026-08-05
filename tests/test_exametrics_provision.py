@@ -360,14 +360,20 @@ async def test_exam_creation_survives_a_provisioning_failure(client, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_exam_creation_still_201_with_provisioning_disabled(client):
+async def test_exam_creation_still_201_with_provisioning_disabled(client, monkeypatch):
     """The default in tests: no base URL, so no key — and no failure either."""
-    h = await _admin(client)
-    exam_id = await _create_exam(client, h, name="Collection Only Exam")
-    assert await _link(exam_id) is None
-    rows = await _audit_rows(exam_id, "PROCESSING_KEY_ISSUE_FAILED")
-    assert len(rows) == 1
-    assert rows[0].after_snapshot["reason"] == "PROVISIONING_DISABLED"
+    monkeypatch.setenv("BACKEND_SIS_BASE_URL", "")
+    from app.config import get_settings
+    get_settings.cache_clear()
+    try:
+        h = await _admin(client)
+        exam_id = await _create_exam(client, h, name="Collection Only Exam")
+        assert await _link(exam_id) is None
+        rows = await _audit_rows(exam_id, "PROCESSING_KEY_ISSUE_FAILED")
+        assert len(rows) == 1
+        assert rows[0].after_snapshot["reason"] == "PROVISIONING_DISABLED"
+    finally:
+        get_settings.cache_clear()
 
 
 # ── Self-healing on submit ───────────────────────────────────────────────────

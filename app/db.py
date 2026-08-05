@@ -84,3 +84,17 @@ async def dispose_engine() -> None:
         await _engine.dispose()
         _engine = None
         _sessionmaker = None
+
+
+def async_sessionmaker_factory() -> async_sessionmaker[AsyncSession]:
+    """Create a standalone async_sessionmaker for use outside FastAPI (e.g. Celery tasks).
+
+    Uses the same DATABASE_URL from settings but creates an independent engine
+    so it can be called from sync contexts that spin up their own event loop.
+    """
+    engine = create_async_engine(
+        get_settings().database_url,
+        pool_pre_ping=True,
+        future=True,
+    )
+    return async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)

@@ -22,6 +22,7 @@ from lazeims_common.enums import ExamPhase
 from lazeims_common.errors import ValidationError
 
 from ..db import get_session
+from ..config import get_settings
 from ..deps import current_user, require_role
 from ..deps_exam import get_exam_roles, require_exam_admin
 from ..enums import ExamRoleName, StandingRoleName
@@ -789,7 +790,7 @@ async def seed_default_subjects(
                 external_ref=str(exam.id),
                 name=exam.name,
                 level=level_name,
-                zone_name=None,
+                zone_name=get_settings().zone_name or None,
                 filling_mode=filling_mode,
                 subjects=subjects,
             )
@@ -860,7 +861,7 @@ async def patch_exam_subject(
                 external_ref=str(exam.id),
                 name=exam.name,
                 level=level_name,
-                zone_name=None,
+                zone_name=get_settings().zone_name or None,
                 filling_mode=filling_mode,
                 subjects=subjects,
             )

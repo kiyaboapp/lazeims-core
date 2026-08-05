@@ -39,7 +39,7 @@ from ..services.exametrics_provision import (
     PROVISIONING_DISABLED,
     ensure_access_key,
 )
-from ..services.processing_submit import build_collection_payload
+from ..services.processing_submit import build_collection_payload, build_school_payloads
 
 router = APIRouter(prefix="/exams", tags=["processing"])
 
@@ -268,30 +268,193 @@ async def get_capabilities(
 
 
 # ── Submit for processing ────────────────────────────────────────────────────
+@router.post("/{exam_id}/processing/push")
+async def push_collection_data(
+    exam_id: uuid.UUID,
+    force: bool = False,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_exam_admin()),
+):
+    """Push the current collected data to ExaMetrics without triggering processing.
+
+    Allowed at any time once the exam has a configured link — use this to sync
+    data daily or whenever convenient. No phase restriction: the backend accepts
+    data at any point and ExaMetrics stores the latest snapshot.
+
+    When force=False (default), only changed rows since the last push are sent.
+    When force=True, the diff cache is cleared and everything is re-pushed.
+
+    The heavy work (loading data, computing diffs, uploading) is done in a
+    background Celery task. This endpoint returns immediately with a task_id.
+    """
+    exam = await _get_exam(db, exam_id)
+
+    existing = await _get_link(db, exam_id)
+    if existing is None or (
+        existing.backend_exam_id is None and existing.key_source == KEY_SOURCE_PROVISIONED
+    ):
+        await ensure_access_key(db, exam, user, rotate=existing is not None)
+
+    link = await _require_link(db, exam_id)
+
+    # Count schools that have marks entered (only these are worth pushing)
+    from sqlalchemy import func, distinct
+    from ..models.exam import ExamStudent, ExamStudentSubject
+    from ..models.marks import TotalMark
+    school_count = (
+        await db.execute(
+            select(func.count(distinct(ExamStudent.school_id)))
+            .select_from(TotalMark)
+            .join(ExamStudentSubject, ExamStudentSubject.id == TotalMark.exam_student_subject_id)
+            .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
+            .where(ExamStudent.exam_id == exam_id)
+        )
+    ).scalar() or 0
+
+    if school_count == 0:
+        return {"status": "no_data", "task_id": None, "total_schools": 0}
+
+    # Kick off the Celery task — all heavy lifting happens there
+    from ..tasks.push_collection import push_collection_chunked
+
+    task = push_collection_chunked.delay(
+        exam_id=str(exam_id),
+        api_key=link.api_key,
+        backend_exam_id=link.backend_exam_id,
+        force=force,
+    )
+
+    link.last_submitted_at = datetime.now(timezone.utc)
+    link.last_status = "PUSHING"
+    await db.flush()
+
+    return {"task_id": task.id, "total_schools": school_count}
+
+
+@router.get("/{exam_id}/processing/push-preview")
+async def push_preview(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(current_user),
+):
+    """Preview what would be pushed: summary counts without loading full data.
+
+    Returns total enrolled schools, how many have been pushed before (cached),
+    and how many are new. Lightweight — no full payload building.
+    """
+    from sqlalchemy import func, distinct
+    from ..models.exam import ExamSchool, ExamStudent, ExamStudentSubject
+    from ..models.marks import TotalMark
+    from ..models.push_cache import CollectionPushCache
+    from ..models.registry import School
+
+    await _get_exam(db, exam_id)
+    link = await _get_link(db, exam_id)
+    if link is None or not link.configured:
+        raise HTTPException(409, detail="Processing link not configured.")
+
+    # Count enrolled schools
+    total_schools = (await db.execute(
+        select(func.count()).select_from(ExamSchool).where(ExamSchool.exam_id == exam_id)
+    )).scalar() or 0
+
+    # Count students
+    total_students = (await db.execute(
+        select(func.count()).select_from(ExamStudent).where(ExamStudent.exam_id == exam_id)
+    )).scalar() or 0
+
+    # Count marks (total_marks rows)
+    total_marks = (await db.execute(
+        select(func.count()).select_from(TotalMark)
+        .join(ExamStudentSubject, ExamStudentSubject.id == TotalMark.exam_student_subject_id)
+        .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
+        .where(ExamStudent.exam_id == exam_id)
+    )).scalar() or 0
+
+    # Count cached entries (already pushed)
+    cached_schools = (await db.execute(
+        select(func.count(distinct(CollectionPushCache.centre_number)))
+        .where(CollectionPushCache.exam_id == exam_id, CollectionPushCache.entity_type == "school")
+    )).scalar() or 0
+
+    cached_students = (await db.execute(
+        select(func.count())
+        .select_from(CollectionPushCache)
+        .where(CollectionPushCache.exam_id == exam_id, CollectionPushCache.entity_type == "student")
+    )).scalar() or 0
+
+    cached_marks = (await db.execute(
+        select(func.count())
+        .select_from(CollectionPushCache)
+        .where(CollectionPushCache.exam_id == exam_id, CollectionPushCache.entity_type == "marks")
+    )).scalar() or 0
+
+    # Last push time
+    last_push = (await db.execute(
+        select(func.max(CollectionPushCache.pushed_at))
+        .where(CollectionPushCache.exam_id == exam_id)
+    )).scalar()
+
+    return {
+        "total_schools": total_schools,
+        "total_students": total_students,
+        "total_marks": total_marks,
+        "cached_schools": cached_schools,
+        "cached_students": cached_students,
+        "cached_marks": cached_marks,
+        "new_schools": total_schools - cached_schools,
+        "new_students": total_students - cached_students,
+        "new_or_changed_marks": total_marks - cached_marks,
+        "last_pushed_at": last_push.isoformat() if last_push else None,
+        "has_changes": (total_schools > cached_schools) or (total_students > cached_students) or (total_marks > cached_marks),
+    }
+
+
+@router.get("/{exam_id}/processing/push-progress")
+async def push_progress(
+    exam_id: uuid.UUID,
+    task_id: str,
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(current_user),
+):
+    from celery.result import AsyncResult
+    from ..celery_app import celery_app
+
+    result = AsyncResult(task_id, app=celery_app)
+    if result.state == "PENDING":
+        return {"state": "PENDING", "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": [], "error": None}
+    elif result.state == "PROGRESS":
+        return {"state": "PROGRESS", **result.info}
+    elif result.state == "SUCCESS":
+        return {"state": "SUCCESS", **result.result}
+    elif result.state == "FAILURE":
+        return {"state": "FAILURE", "error": str(result.result), "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": []}
+    else:
+        return {"state": result.state, "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": [], "error": None}
+
+
 @router.post("/{exam_id}/processing/submit", response_model=ExamOut)
 async def submit_for_processing(
     exam_id: uuid.UUID,
     db: AsyncSession = Depends(get_session),
     user: User = Depends(require_exam_admin()),
 ):
-    """Push the collected data to ExaMetrics, trigger processing, and move the
-    exam into PROCESSING. Allowed from ENTRY_LOCKED (first run) or PROCESSING
-    (re-submit after edits).
+    """Push the collected data to ExaMetrics AND trigger processing. This
+    transitions the exam into PROCESSING and requires ENTRY_LOCKED (closeout).
 
-    Heals itself first: an exam with no link at all, or one whose provisioned key
-    never got an ExaMetrics exam id, is provisioned here rather than telling the
-    operator to go and configure something. A hand-entered (``MANUAL``) key is
-    left alone.
+    For pushing data without triggering processing (e.g. daily syncs), use
+    POST /{exam_id}/processing/push instead.
     """
     exam = await _get_exam(db, exam_id)
 
-    # Phase first: a request that cannot proceed must not burn a key rotation,
-    # because the 409 would roll back the link we just wrote while ExaMetrics has
-    # already revoked the key it replaced.
     if exam.phase not in (ExamPhase.ENTRY_LOCKED, ExamPhase.PROCESSING):
         raise HTTPException(
             409,
-            f"Submit is only allowed from ENTRY_LOCKED or PROCESSING (current: {exam.phase.value}).",
+            detail={
+                "code": "PHASE_REQUIRED",
+                "message": "Triggering processing requires the exam to be sealed (ENTRY_LOCKED). "
+                           "To push data without processing, use the 'Push data' action instead.",
+            },
         )
 
     existing = await _get_link(db, exam_id)
@@ -302,8 +465,7 @@ async def submit_for_processing(
 
     link = await _require_link(db, exam_id)
 
-    # Sync the exam definition before pushing collection. Best-effort: ExaMetrics
-    # may reject if processing has started; we log but continue with collection.
+    # Sync the exam definition before pushing collection. Best-effort.
     from ..services.exametrics_provision import build_subjects_payload
     try:
         level = await db.get(ExamLevel, exam.level_id)
@@ -315,18 +477,13 @@ async def submit_for_processing(
             external_ref=str(exam.id),
             name=exam.name,
             level=level_name,
-            zone_name=None,
+            zone_name=get_settings().zone_name or None,
             filling_mode=filling_mode,
             subjects=subjects,
         )
-    except BackendSisError as exc:
-        if exc.status_code == 409 and exc.code == "EXAM_STATE_CONFLICT":
-            # Definition changed after processing started - that's fine, continue
-            pass
-        else:
-            raise _sis_http(exc)
+    except BackendSisError:
+        pass
     except Exception:  # noqa: BLE001
-        # Any other error is best-effort, don't block collection
         pass
 
     payload = await build_collection_payload(db, exam)
