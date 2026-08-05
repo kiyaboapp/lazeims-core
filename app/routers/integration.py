@@ -183,8 +183,8 @@ async def request_access_key(
             detail={
                 "code": PROVISIONING_DISABLED,
                 "message": (
-                    "This deployment cannot request ExaMetrics keys automatically "
-                    "(no ExaMetrics base URL is configured)."
+                    "ExaMetrics integration is not configured on this deployment "
+                    "(no ExaMetrics URL is set)."
                 ),
             },
         )
