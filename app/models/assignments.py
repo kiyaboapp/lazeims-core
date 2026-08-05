@@ -53,6 +53,7 @@ class Station(Base, TimestampMixin):
     region_id: Mapped[int | None] = mapped_column(ForeignKey("regions.id"), nullable=True)
     council_id: Mapped[int | None] = mapped_column(ForeignKey("councils.id"), nullable=True)
     ward_id: Mapped[int | None] = mapped_column(ForeignKey("wards.id"), nullable=True)
+    subject_codes: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # optional subject scope: ["012","032",...] or null=all
     managed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     sync_key_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     software_version: Mapped[str | None] = mapped_column(String(40), nullable=True)

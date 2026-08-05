@@ -17,6 +17,7 @@ class StationIn(BaseModel):
     ward_id: int | None = None
     scope_mode: str | None = None  # 'LOCATION' or 'SCHOOLS'
     school_ids: list[int] | None = None
+    subject_codes: list[str] | None = None  # optional subject restriction
     managed_by: int | None = None
 
 
@@ -28,6 +29,7 @@ class StationScopeIn(BaseModel):
     council_id: int | None = None
     ward_id: int | None = None
     school_ids: list[int] | None = None
+    subject_codes: list[str] | None = None  # optional subject restriction
 
 
 class StationOut(BaseModel):
@@ -40,6 +42,7 @@ class StationOut(BaseModel):
     region_id: int | None
     council_id: int | None
     ward_id: int | None
+    subject_codes: list[str] | None = None
     school_ids: list[int] | None = None
     is_active: bool
     software_version: str | None

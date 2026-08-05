@@ -635,6 +635,7 @@ async def detach_school(
 async def list_exam_subjects(
     exam_id: uuid.UUID,
     school_id: int | None = Query(None, description="When set, return only subjects that have registered students at this school."),
+    school_ids: str | None = Query(None, description="Comma-separated school IDs. When set, return only subjects with students at any of these schools."),
     db: AsyncSession = Depends(get_session),
     _: User = Depends(current_user),
 ):
@@ -644,8 +645,24 @@ async def list_exam_subjects(
     Pass ``school_id`` to get only subjects that have at least one registered
     student at that school — this is what the data entry scope selector needs
     so enterers never see subjects with no candidates to enter marks for.
+
+    Pass ``school_ids`` (comma-separated) to filter by multiple schools at once
+    (used by the package generation dialog).
     """
     from ..models.registry import Subject as _Subject
+
+    # Resolve school filter
+    resolved_school_ids: list[int] | None = None
+    if school_ids:
+        resolved_school_ids = [int(s.strip()) for s in school_ids.split(",") if s.strip().isdigit()]
+    elif school_id is not None:
+        resolved_school_ids = [school_id]
+
+    school_filter = (
+        ExamStudent.school_id.in_(resolved_school_ids)
+        if resolved_school_ids
+        else ExamStudent.exam_id == exam_id
+    )
 
     counts = dict(
         (
@@ -654,11 +671,7 @@ async def list_exam_subjects(
                 .join(ExamSubject, ExamSubject.id == ExamStudentSubject.exam_subject_id)
                 .join(ExamStudent, ExamStudent.id == ExamStudentSubject.exam_student_id)
                 .where(ExamSubject.exam_id == exam_id)
-                .where(
-                    ExamStudent.school_id == school_id
-                    if school_id is not None
-                    else ExamStudent.exam_id == exam_id
-                )
+                .where(school_filter)
                 .group_by(ExamStudentSubject.exam_subject_id)
             )
         ).all()
@@ -670,8 +683,8 @@ async def list_exam_subjects(
         .where(ExamSubject.exam_id == exam_id)
     )
 
-    # When filtering by school, only return subjects that have students there
-    if school_id is not None:
+    # When filtering by school(s), only return subjects that have students there
+    if resolved_school_ids is not None:
         rows_query = rows_query.where(ExamSubject.id.in_(counts.keys()))
 
     rows = (

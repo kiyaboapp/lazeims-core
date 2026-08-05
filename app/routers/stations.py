@@ -94,6 +94,7 @@ async def create_station(
         scope_mode=payload.scope_mode,
         region_id=payload.region_id, council_id=payload.council_id,
         ward_id=payload.ward_id,
+        subject_codes=payload.subject_codes or None,
         managed_by=payload.managed_by or user.id,
         sync_key_hash=None, is_active=True,
     )
@@ -132,6 +133,7 @@ async def update_station_scope(
     """Update a station's scope (mode + location or school list)."""
     st = await _get_station(db, exam_id, station_id)
     st.scope_mode = payload.scope_mode
+    st.subject_codes = payload.subject_codes or None
     if payload.scope_mode == 'LOCATION':
         st.region_id = payload.region_id
         st.council_id = payload.council_id

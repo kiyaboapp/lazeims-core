@@ -46,7 +46,7 @@ from ..models.exam import (
     ExamStudentSubject,
     ExamSubject,
 )
-from ..models.registry import School, Subject
+from ..models.registry import Council, Region, School, Subject
 from ..models.scoring import Question, QuestionGroup, QuestionTopic
 from ..models.station import StationMachineCredential, StationPackage
 from ..security import hash_secret
@@ -258,6 +258,17 @@ async def build_package_seed(
     school_rows = (
         await db.execute(select(School).where(School.centre_number.in_(schools)))
     ).scalars().all()
+    # Pre-fetch region/council names for inclusion in the seed
+    region_ids = {s.region_id for s in school_rows if s.region_id}
+    council_ids = {s.council_id for s in school_rows if s.council_id}
+    region_names: dict[int, str] = {}
+    council_names: dict[int, str] = {}
+    if region_ids:
+        rows = (await db.execute(select(Region).where(Region.id.in_(region_ids)))).scalars().all()
+        region_names = {r.id: r.name for r in rows}
+    if council_ids:
+        rows = (await db.execute(select(Council).where(Council.id.in_(council_ids)))).scalars().all()
+        council_names = {c.id: c.name for c in rows}
     school_by_id = {s.id: s for s in school_rows}
     in_scope_school_ids = set(school_by_id)
 
@@ -383,7 +394,15 @@ async def build_package_seed(
     ]
 
     return {
-        "schools": [{"centre_number": s.centre_number, "name": s.name} for s in school_rows],
+        "schools": [
+            {
+                "centre_number": s.centre_number,
+                "name": s.name,
+                "council_name": council_names.get(s.council_id) if s.council_id else None,
+                "region_name": region_names.get(s.region_id) if s.region_id else None,
+            }
+            for s in school_rows
+        ],
         "subjects": subjects_out,
         "students": students_out,
         "registrations": registrations_out,
@@ -430,6 +449,23 @@ async def generate_station_package(
             {"missing": sorted(missing_schools)},
         )
     school_ids = list(school_map.values())
+
+    # Validate schools fall within the station's geographic scope (if set)
+    if station.scope_mode == "LOCATION" and (station.council_id or station.region_id):
+        out_of_scope: list[str] = []
+        for centre, sid in school_map.items():
+            school_obj = await db.get(School, sid)
+            if station.council_id and school_obj and school_obj.council_id != station.council_id:
+                out_of_scope.append(centre)
+            elif not station.council_id and station.region_id and school_obj and school_obj.region_id != station.region_id:
+                out_of_scope.append(centre)
+        if out_of_scope:
+            raise PackagePreparationError(
+                PackageErrorCode.SCOPE_VIOLATION,
+                f"{len(out_of_scope)} school(s) are outside this station's "
+                f"geographic scope. Remove them or update the station scope.",
+                {"out_of_scope_schools": sorted(out_of_scope)[:20], "total": len(out_of_scope)},
+            )
 
     paper_set = [PaperType(p) for p in papers]
 
