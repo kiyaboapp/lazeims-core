@@ -97,17 +97,31 @@ async def compute_entry_open_readiness(db: AsyncSession, exam: Exam) -> Readines
     # Item-level exams need scoring configuration + a sealed version.
     filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
     if filling_mode == "ITEM_LEVEL":
+        from ..models.registry import Subject as _Subj
+
+        # Single query: get subject labels + question counts per (exam_subject_id, paper_type)
+        code_rows = (await db.execute(
+            select(ExamSubject.id, _Subj.code, _Subj.name)
+            .join(_Subj, _Subj.id == ExamSubject.subject_id)
+            .where(ExamSubject.exam_id == exam.id)
+        )).all()
+        subject_label = {es_id: f"{code} {name}" for es_id, code, name in code_rows}
+
+        # Batch: all question counts grouped by (exam_subject_id, paper_type)
+        q_counts = dict(
+            ((row[0], row[1]), row[2])
+            for row in (await db.execute(
+                select(Question.exam_subject_id, Question.paper_type, func.count())
+                .where(Question.exam_subject_id.in_([s.id for s in subjects]))
+                .group_by(Question.exam_subject_id, Question.paper_type)
+            )).all()
+        )
+
         subjects_missing_questions = []
         for subj in subjects:
             for paper in applicable_papers(subj):
-                qn = await db.scalar(
-                    select(func.count()).select_from(Question).where(
-                        Question.exam_subject_id == subj.id,
-                        Question.paper_type == paper,
-                    )
-                )
-                if not qn:
-                    subjects_missing_questions.append(f"subject#{subj.id}/{paper.value}")
+                if not q_counts.get((subj.id, paper), 0):
+                    subjects_missing_questions.append(f"{subject_label[subj.id]}/{paper.value}")
         checks.append(ReadinessItem(
             "item_config_complete",
             len(subjects_missing_questions) == 0,

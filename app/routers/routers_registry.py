@@ -436,6 +436,24 @@ async def list_schools(
     )
 
 
+@router.get("/schools/geography-summary")
+async def schools_geography_summary(
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(current_user),
+):
+    """Distinct region/council IDs that have at least one school.
+
+    Used by frontend dropdowns to hide empty geography entries.
+    """
+    regions = (await db.execute(
+        select(func.distinct(School.region_id)).where(School.region_id.isnot(None))
+    )).scalars().all()
+    councils = (await db.execute(
+        select(func.distinct(School.council_id)).where(School.council_id.isnot(None))
+    )).scalars().all()
+    return {"regions": list(regions), "councils": list(councils)}
+
+
 @router.get("/schools/{school_id}", response_model=SchoolDetail)
 async def get_school(
     school_id: int,

@@ -25,6 +25,19 @@ class AttendanceIn(BaseModel):
     source: AttendanceSource = AttendanceSource.INVIGILATOR_ISAL_TRANSCRIPTION
 
 
+class BulkAttendanceEntry(BaseModel):
+    student_id: str
+    is_present: bool
+
+
+class BulkAttendanceIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    exam_subject_id: int
+    paper_type: PaperType
+    entries: list[BulkAttendanceEntry] = Field(min_length=1)
+    source: AttendanceSource = AttendanceSource.INVIGILATOR_ISAL_TRANSCRIPTION
+
+
 class CalBaselineEntry(BaseModel):
     student_id: str
     is_present: bool

@@ -183,12 +183,12 @@ async def main() -> None:
                 is_male = rng.random() < 0.5
                 sex = Sex.M if is_male else Sex.F
                 if is_male:
-                    first = fake.first_name_male()
-                    middle = fake.first_name_male() if rng.random() < 0.7 else None
+                    first = fake.first_name_male().upper()
+                    middle = fake.first_name_male().upper()
                 else:
-                    first = fake.first_name_female()
-                    middle = fake.first_name_female() if rng.random() < 0.7 else None
-                surname = fake.last_name()
+                    first = fake.first_name_female().upper()
+                    middle = fake.first_name_female().upper()
+                surname = fake.last_name().upper()
 
                 student = ExamStudent(
                     student_id=candidate_id, exam_id=exam.id, school_id=school.id,

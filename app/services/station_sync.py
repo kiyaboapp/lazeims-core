@@ -301,22 +301,53 @@ async def compute_central_scope_digest(
     ).all()
 
     records = []
-    for student, ess in students:
-        present = await resolve_effective_attendance(db, ess.id, paper_type)
-        if is_item:
-            rows = (
-                await db.execute(select(ItemMark.question_id, ItemMark.marks_obtained).where(
-                    ItemMark.exam_student_subject_id == ess.id,
-                    ItemMark.question_id.in_(list(qnum_by_id))))
-            ).all()
-            items = {qnum_by_id[qid]: v for qid, v in rows}
+    if not students:
+        return scope_digest(records), counts_from_records(records).as_dict()
+
+    ess_ids = [ess.id for _, ess in students]
+
+    # Batch attendance
+    from ..models.marks import Attendance as _Att
+    att_rows = (await db.execute(
+        select(_Att.exam_student_subject_id, _Att.paper_type, _Att.is_present)
+        .where(_Att.exam_student_subject_id.in_(ess_ids), _Att.paper_type.in_([paper_type, PaperType.ALL]))
+    )).all()
+    att_specific: dict[int, bool] = {}
+    att_all_map: dict[int, bool] = {}
+    for ess_id, pt, is_present in att_rows:
+        pt_val = pt.value if hasattr(pt, 'value') else pt
+        if pt_val == paper_type.value:
+            att_specific[ess_id] = is_present
+        elif pt_val == 'ALL':
+            att_all_map[ess_id] = is_present
+    att_map = {ess_id: att_specific.get(ess_id, att_all_map.get(ess_id, True)) for ess_id in ess_ids}
+
+    if is_item:
+        # Batch item marks
+        im_rows = (await db.execute(
+            select(ItemMark.exam_student_subject_id, ItemMark.question_id, ItemMark.marks_obtained)
+            .where(ItemMark.exam_student_subject_id.in_(ess_ids), ItemMark.question_id.in_(list(qnum_by_id)))
+        )).all()
+        im_by_ess: dict[int, dict] = {}
+        for ess_id, qid, v in im_rows:
+            im_by_ess.setdefault(ess_id, {})[qnum_by_id[qid]] = v
+
+        for student, ess in students:
+            present = att_map.get(ess.id, True)
+            items = im_by_ess.get(ess.id, {})
             if present or items:
                 records.append(normalize_item_record(student.student_id, present, items))
-        else:
-            tm = (
-                await db.execute(select(TotalMark.total_marks_obtained).where(
-                    TotalMark.exam_student_subject_id == ess.id, TotalMark.paper_type == paper_type))
-            ).scalar_one_or_none()
+    else:
+        # Batch total marks
+        tm_rows = (await db.execute(
+            select(TotalMark.total_marks_obtained, TotalMark.exam_student_subject_id)
+            .where(TotalMark.exam_student_subject_id.in_(ess_ids), TotalMark.paper_type == paper_type)
+        )).all()
+        tm_map = {r[1]: r[0] for r in tm_rows}
+
+        for student, ess in students:
+            present = att_map.get(ess.id, True)
+            tm = tm_map.get(ess.id)
             records.append(normalize_total_record(student.student_id, present, tm))
 
     return scope_digest(records), counts_from_records(records).as_dict()

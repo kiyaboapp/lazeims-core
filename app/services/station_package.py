@@ -93,19 +93,27 @@ async def validate_and_assign_scopes(
     conflicts: list[dict] = []
     assignments: list[ScopeWriteAssignment] = []
 
+    # Batch-load all existing assignments for the requested scopes in one query
+    existing_rows = (
+        await db.execute(
+            select(ScopeWriteAssignment).where(
+                ScopeWriteAssignment.exam_id == exam_id,
+                ScopeWriteAssignment.school_id.in_(school_ids),
+                ScopeWriteAssignment.exam_subject_id.in_(exam_subject_ids),
+                ScopeWriteAssignment.paper_type.in_(paper_types),
+            )
+        )
+    ).scalars().all()
+    existing_map = {
+        (r.school_id, r.exam_subject_id, r.paper_type.value if hasattr(r.paper_type, 'value') else r.paper_type): r
+        for r in existing_rows
+    }
+
     for school_id in school_ids:
         for es_id in exam_subject_ids:
             for paper in paper_types:
-                existing = (
-                    await db.execute(
-                        select(ScopeWriteAssignment).where(
-                            ScopeWriteAssignment.exam_id == exam_id,
-                            ScopeWriteAssignment.school_id == school_id,
-                            ScopeWriteAssignment.exam_subject_id == es_id,
-                            ScopeWriteAssignment.paper_type == paper,
-                        )
-                    )
-                ).scalar_one_or_none()
+                key = (school_id, es_id, paper.value if hasattr(paper, 'value') else paper)
+                existing = existing_map.get(key)
 
                 if existing is None:
                     new_assign = ScopeWriteAssignment(

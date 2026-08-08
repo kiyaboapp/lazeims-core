@@ -88,31 +88,60 @@ async def evaluate_scope(
     scope_wide_incident = any(i.exam_student_subject_id is None for i in incident_rows)
 
     states: list[StudentScopeState] = []
+    ess_ids = [ess.id for _, ess in rows]
+
+    # Batch: attendance for all students
+    from ..models.marks import Attendance as _Att
+    att_rows = (await db.execute(
+        select(_Att.exam_student_subject_id, _Att.paper_type, _Att.is_present)
+        .where(
+            _Att.exam_student_subject_id.in_(ess_ids),
+            _Att.paper_type.in_([paper_type, PaperType.ALL]),
+        )
+    )).all() if ess_ids else []
+    # Resolve attendance: specific paper overrides ALL
+    att_specific: dict[int, bool] = {}
+    att_all: dict[int, bool] = {}
+    for ess_id, pt, is_present in att_rows:
+        pt_val = pt.value if hasattr(pt, 'value') else pt
+        if pt_val == paper_type.value:
+            att_specific[ess_id] = is_present
+        elif pt_val == 'ALL':
+            att_all[ess_id] = is_present
+    att_map = {ess_id: att_specific.get(ess_id, att_all.get(ess_id, True)) for ess_id in ess_ids}
+
+    # Batch: marks completeness
+    if mode == FillingMode.TOTAL_MARKS:
+        tm_set = set(
+            (await db.execute(
+                select(TotalMark.exam_student_subject_id).where(
+                    TotalMark.exam_student_subject_id.in_(ess_ids),
+                    TotalMark.paper_type == paper_type,
+                )
+            )).scalars().all()
+        ) if ess_ids else set()
+    else:
+        # Item mode: count how many required questions each student answered
+        im_counts: dict[int, int] = {}
+        if required_qids and ess_ids:
+            from sqlalchemy import func as _fn
+            im_rows = (await db.execute(
+                select(ItemMark.exam_student_subject_id, _fn.count(ItemMark.id))
+                .where(
+                    ItemMark.exam_student_subject_id.in_(ess_ids),
+                    ItemMark.question_id.in_(required_qids),
+                )
+                .group_by(ItemMark.exam_student_subject_id)
+            )).all()
+            im_counts = {r[0]: r[1] for r in im_rows}
+
     for student, ess in rows:
-        is_present = await resolve_effective_attendance(db, ess.id, paper_type)
+        is_present = att_map.get(ess.id, True)
+
         if mode == FillingMode.TOTAL_MARKS:
-            tm = (
-                await db.execute(
-                    select(TotalMark.id).where(
-                        TotalMark.exam_student_subject_id == ess.id,
-                        TotalMark.paper_type == paper_type,
-                    )
-                )
-            ).scalar_one_or_none()
-            complete = tm is not None
+            complete = ess.id in tm_set
         else:
-            count = 0
-            if required_qids:
-                count = len(
-                    (
-                        await db.execute(
-                            select(ItemMark.id).where(
-                                ItemMark.exam_student_subject_id == ess.id,
-                                ItemMark.question_id.in_(required_qids),
-                            )
-                        )
-                    ).scalars().all()
-                )
+            count = im_counts.get(ess.id, 0)
             complete = bool(required_qids) and count == len(required_qids)
 
         # Absent students are complete-by-definition (no marks expected).

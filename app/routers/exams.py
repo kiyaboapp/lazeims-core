@@ -52,7 +52,6 @@ from ..schemas_exam import (
     ExamStudentOut,
     ExamSubjectIn,
     ExamSubjectOut,
-    ExamSubjectPatch,
     PhaseTransitionIn,
     ReadinessOut,
     RoleAssignmentIn,
@@ -144,11 +143,8 @@ async def create_exam(
             filter_col = Subject.is_primary
             extra_filter = None
         elif level_name == "CSEE":
-            # CSEE: academic O-level subjects only (codes 011–099).
-            # Vocational/trade subjects (200+, 800-series, L0x, A0x etc.) are
-            # O-level too but belong to FTNA vocational tracks, not CSEE.
             filter_col = Subject.is_olevel
-            extra_filter = Subject.code.regexp_match(r'^0[0-9]{2}$')
+            extra_filter = None
         elif level_name == "FTNA":
             # FTNA: all O-level subjects including vocational trades
             filter_col = Subject.is_olevel
@@ -308,6 +304,11 @@ async def get_entry_scopes(
     Returns a flat list for simplicity; the client builds the hierarchy.
     """
     from ..models.registry import Region, Council, School
+    from ..services import exam_cache
+
+    cached = exam_cache.get(exam_id, "entry_scopes")
+    if cached is not None:
+        return cached
 
     rows = (
         await db.execute(
@@ -342,6 +343,7 @@ async def get_entry_scopes(
                 centre_number=r.centre_number,
             )
         )
+    exam_cache.put(exam_id, "entry_scopes", scopes)
     return scopes
 
 
@@ -413,6 +415,11 @@ async def list_exam_schools(exam_id: uuid.UUID, db: AsyncSession = Depends(get_s
     the whole school registry just to render this list.
     """
     from ..models.registry import School as _School, Council as _Council, Region as _Region
+    from ..services import exam_cache
+
+    cached = exam_cache.get(exam_id, "schools_list")
+    if cached is not None:
+        return cached
 
     rows = (
         await db.execute(
@@ -434,7 +441,7 @@ async def list_exam_schools(exam_id: uuid.UUID, db: AsyncSession = Depends(get_s
             .order_by(_School.centre_number)
         )
     ).all()
-    return [
+    result = [
         {
             "id": r.id,
             "school_id": r.school_id,
@@ -448,6 +455,8 @@ async def list_exam_schools(exam_id: uuid.UUID, db: AsyncSession = Depends(get_s
         }
         for r in rows
     ]
+    exam_cache.put(exam_id, "schools_list", result)
+    return result
 
 
 @router.post("/{exam_id}/schools", status_code=201)
@@ -463,6 +472,8 @@ async def attach_school(
         await db.flush()
     except IntegrityError:
         raise HTTPException(409, "school already attached")
+    from ..services import exam_cache
+    exam_cache.invalidate_schools(exam_id)
     return {"id": row.id, "school_id": row.school_id}
 
 
@@ -535,6 +546,10 @@ async def bulk_enroll_schools(
         db.add(ExamSchool(exam_id=exam_id, school_id=school_id))
     await db.flush()
 
+    from ..services import exam_cache
+    if to_add:
+        exam_cache.invalidate_schools(exam_id)
+
     return {
         "enrolled": len(to_add),
         "skipped": len(already),
@@ -551,6 +566,11 @@ async def exam_schools_stats(
     Lets the enrolled-schools page show coverage without paging the whole list.
     """
     from ..models.registry import Region as _Region, School as _School
+    from ..services import exam_cache
+
+    cached = exam_cache.get(exam_id, "schools_stats")
+    if cached is not None:
+        return cached
 
     total = await db.scalar(
         select(func.count()).select_from(ExamSchool).where(ExamSchool.exam_id == exam_id)
@@ -581,7 +601,7 @@ async def exam_schools_stats(
         )
     ).all()
 
-    return {
+    result = {
         "total": total or 0,
         "with_candidates": with_candidates or 0,
         "without_candidates": (total or 0) - (with_candidates or 0),
@@ -591,6 +611,8 @@ async def exam_schools_stats(
             for t, c in by_type
         ],
     }
+    exam_cache.put(exam_id, "schools_stats", result)
+    return result
 
 
 @router.delete("/{exam_id}/schools/{school_id}", status_code=204)
@@ -627,6 +649,8 @@ async def detach_school(
 
     await db.delete(row)
     await db.flush()
+    from ..services import exam_cache
+    exam_cache.invalidate_schools(exam_id)
     return Response(status_code=204)
 
 
@@ -651,6 +675,7 @@ async def list_exam_subjects(
     (used by the package generation dialog).
     """
     from ..models.registry import Subject as _Subject
+    from ..services import exam_cache
 
     # Resolve school filter
     resolved_school_ids: list[int] | None = None
@@ -658,6 +683,19 @@ async def list_exam_subjects(
         resolved_school_ids = [int(s.strip()) for s in school_ids.split(",") if s.strip().isdigit()]
     elif school_id is not None:
         resolved_school_ids = [school_id]
+
+    # Cache the base subject rows (code, name, config) — they rarely change
+    cache_key = "subjects_base"
+    cached_rows = exam_cache.get(exam_id, cache_key)
+    if cached_rows is None:
+        rows_query = (
+            select(ExamSubject, _Subject.code, _Subject.name)
+            .join(_Subject, _Subject.id == ExamSubject.subject_id)
+            .where(ExamSubject.exam_id == exam_id)
+            .order_by(_Subject.code)
+        )
+        cached_rows = (await db.execute(rows_query)).all()
+        exam_cache.put(exam_id, cache_key, cached_rows)
 
     school_filter = (
         ExamStudent.school_id.in_(resolved_school_ids)
@@ -678,19 +716,10 @@ async def list_exam_subjects(
         ).all()
     )
 
-    rows_query = (
-        select(ExamSubject, _Subject.code, _Subject.name)
-        .join(_Subject, _Subject.id == ExamSubject.subject_id)
-        .where(ExamSubject.exam_id == exam_id)
-    )
-
     # When filtering by school(s), only return subjects that have students there
+    rows = cached_rows
     if resolved_school_ids is not None:
-        rows_query = rows_query.where(ExamSubject.id.in_(counts.keys()))
-
-    rows = (
-        await db.execute(rows_query.order_by(_Subject.code))
-    ).all()
+        rows = [(es, code, name) for es, code, name in cached_rows if es.id in counts]
 
     out: list[ExamSubjectOut] = []
     for exam_subject, code, name in rows:
@@ -715,6 +744,8 @@ async def attach_subject(
         await db.flush()
     except IntegrityError:
         raise HTTPException(409, "subject already offered")
+    from ..services import exam_cache
+    exam_cache.invalidate_subjects(exam_id)
     return ExamSubjectOut.model_validate(row)
 
 
@@ -772,7 +803,7 @@ async def seed_default_subjects(
     await db.flush()
 
     # Sync the exam definition (subjects + max marks) to ExaMetrics after
-    # seeding. Best-effort: same error handling as patch_exam_subject.
+    # seeding. Best-effort.
     try:
         level = await db.get(_ExamLevel, exam.level_id)
         level_name = (level.name or "").upper() if level else ""
@@ -798,77 +829,6 @@ async def seed_default_subjects(
         pass
 
     return {"level": level_name, "added": added, "skipped": len(existing), "matched": len(candidates)}
-
-
-@router.patch("/{exam_id}/subjects/{exam_subject_id}", response_model=ExamSubjectOut)
-async def patch_exam_subject(
-    exam_id: uuid.UUID, exam_subject_id: int, payload: ExamSubjectPatch,
-    db: AsyncSession = Depends(get_session), user: User = Depends(require_exam_admin()),
-):
-    """Update one subject's paper configuration (which papers exist and their
-    maximum marks). Locked outside REGISTRATION — these values define how marks
-    are validated."""
-    exam = await _get_exam(db, exam_id)
-    _require_registration_phase(exam)
-
-    row = (
-        await db.execute(
-            select(ExamSubject).where(
-                ExamSubject.id == exam_subject_id, ExamSubject.exam_id == exam_id
-            )
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        raise HTTPException(404, "subject is not offered in this exam")
-
-    updates = payload.model_dump(exclude_unset=True)
-    for key, value in updates.items():
-        if value is not None:
-            setattr(row, key, value)
-
-    # Keep maxima coherent with which papers are enabled.
-    if not row.has_theory2:
-        row.total_marks_theory2 = 0
-    elif row.total_marks_theory2 == 0:
-        row.total_marks_theory2 = 100
-    if not row.has_practical:
-        row.total_marks_practical = 0
-    elif row.total_marks_practical == 0:
-        row.total_marks_practical = 100
-    if row.total_marks_theory1 <= 0:
-        raise HTTPException(422, "Theory 1 maximum marks must be greater than zero.")
-
-    await db.flush()
-
-    # Sync the exam definition (subjects + max marks) to ExaMetrics after any
-    # subject configuration change. Best-effort: ExaMetrics may reject if
-    # processing has started; we log but don't fail the PATCH request.
-    try:
-        level = await db.get(ExamLevel, exam.level_id)
-        level_name = (level.name if level else "").upper()
-        subjects = await build_subjects_payload(db, exam)
-        filling_mode = (exam.settings or {}).get("filling_mode", "TOTAL_MARKS")
-        # Need to get the link's api_key - pull the processing link
-        from ..models.processing import ExamProcessingLink
-        link = (
-            await db.execute(
-                select(ExamProcessingLink).where(ExamProcessingLink.exam_id == exam.id)
-            )
-        ).scalar_one_or_none()
-        if link and link.api_key:
-            await backend_sis.upsert_exam_definition(
-                link.api_key,
-                external_ref=str(exam.id),
-                name=exam.name,
-                level=level_name,
-                zone_name=get_settings().zone_name or None,
-                filling_mode=filling_mode,
-                subjects=subjects,
-            )
-    except Exception:  # noqa: BLE001 — best effort, don't fail the PATCH
-        pass
-
-    return ExamSubjectOut.model_validate(row)
 
 
 @router.delete("/{exam_id}/subjects/{exam_subject_id}", status_code=204)
@@ -903,6 +863,8 @@ async def detach_subject(
 
     await db.delete(row)
     await db.flush()
+    from ..services import exam_cache
+    exam_cache.invalidate_subjects(exam_id)
     return Response(status_code=204)
 
 
@@ -998,6 +960,8 @@ async def remove_student(
     )
     await db.delete(student)
     await db.flush()
+    from ..services import exam_cache
+    exam_cache.invalidate_students(exam_id)
     return Response(status_code=204)
 
 
@@ -1024,6 +988,8 @@ async def register_student(
         await db.flush()
     except IntegrityError:
         raise HTTPException(422, "invalid or duplicate subject registration")
+    from ..services import exam_cache
+    exam_cache.invalidate_students(exam_id)
     return ExamStudentOut.model_validate(student)
 
 
@@ -1123,6 +1089,11 @@ async def set_subject_questions(
         for t in q.topics:
             db.add(QuestionTopic(question_id=qrow.id, topic_id=t.topic_id, weight=t.weight))
     await db.flush()
+    from ..services import exam_cache
+    # Invalidate all cached question configs for this subject (all paper types)
+    for pt in ("THEORY1", "THEORY2", "PRACTICAL"):
+        exam_cache.invalidate(exam_id, f"questions:{exam_subject_id}:{pt}")
+    exam_cache.invalidate(exam_id, "subjects_base")
     return {"status": "ok", "exam_subject_id": exam_subject_id,
             "groups": len(payload.groups), "questions": len(payload.questions)}
 
