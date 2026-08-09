@@ -6,8 +6,12 @@ dispatches this task. The task:
 2. Computes diffs against the push cache
 3. Starts a collection session on ExaMetrics
 4. Uploads one school per chunk
-5. Updates the push cache after each successful chunk
+5. Updates the push cache after each successful chunk (single session, commit per chunk)
 6. Reports progress throughout
+
+Connection discipline: ONE engine, ONE session for the entire task. The session
+is committed after each chunk's cache update so we never hold a long transaction
+and never leak connections — even for 1750+ schools.
 """
 from __future__ import annotations
 
@@ -30,6 +34,9 @@ async def _build_and_push(
     task_id: str,
 ) -> dict:
     """Build payloads per-school and push each one as a chunk."""
+    from sqlalchemy import update as sa_update
+    from datetime import datetime, timezone
+
     from ..services import backend_sis
     from ..services.push_diff import (
         clear_cache,
@@ -40,24 +47,26 @@ async def _build_and_push(
     from ..services.processing_submit import build_school_payloads
     from ..db import async_sessionmaker_factory
     from ..models.exam import Exam
+    from ..models.processing import ExamProcessingLink
     from lazeims_common.exametrics_digest import collection_digest, merge_chunks
 
     exam_uuid = uuid.UUID(exam_id)
 
-    # Step 1: Build per-school payloads (this is the heavy part)
+    # ONE engine/pool for the entire task.
+    _session_factory = async_sessionmaker_factory()
+
+    # Step 1: Build per-school payloads
     task.update_state(state="PROGRESS", meta={
         "total_schools": 0, "completed": 0, "phase": "building",
         "current_school": None, "schools_done": [], "schools_failed": [],
     })
 
-    async with async_sessionmaker_factory()() as db:
+    async with _session_factory() as db:
         exam = await db.get(Exam, exam_uuid)
         if not exam:
             return {"error": "Exam not found", "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": []}
 
-        # Sync exam definition (best-effort). Subjects are NOT sent here —
-        # ExaMetrics seeds its own subjects based on exam level via factory data.
-        # Collection payload carries only the subjects that have actual marks.
+        # Sync exam definition (best-effort)
         try:
             from ..models.registry import ExamLevel
             from ..config import get_settings
@@ -87,7 +96,7 @@ async def _build_and_push(
         else:
             cache = await load_cache(db, exam_uuid)
 
-    # Step 2: Filter by diff
+    # Step 2: Filter by diff (pure computation, no DB)
     filtered_payloads: list[dict] = []
     cache_updates_by_school: list[list[tuple]] = []
 
@@ -98,16 +107,12 @@ async def _build_and_push(
         filtered_payloads.append(filtered)
         cache_updates_by_school.append(updates)
 
-    # Free the full payloads
-    del school_payloads
+    del school_payloads  # free memory
 
     total = len(filtered_payloads)
     if total == 0:
-        # Nothing to push — reset status
-        from ..models.processing import ExamProcessingLink
-        from sqlalchemy import update as sa_update
         try:
-            async with async_sessionmaker_factory()() as db:
+            async with _session_factory() as db:
                 await db.execute(
                     sa_update(ExamProcessingLink)
                     .where(ExamProcessingLink.exam_id == exam_uuid)
@@ -122,80 +127,79 @@ async def _build_and_push(
             "status": "no_changes",
         }
 
-    # Step 3: Start collection session
+    # Step 3: Start collection session on ExaMetrics
     task.update_state(state="PROGRESS", meta={
         "total_schools": total, "completed": 0, "phase": "uploading",
         "current_school": None, "schools_done": [], "schools_failed": [],
     })
 
     digest = collection_digest(merge_chunks(filtered_payloads))
-
-    session_payload = {
-        "chunk_count": total,
-        "expected_digest": digest,
-    }
+    session_payload = {"chunk_count": total, "expected_digest": digest}
     session = await backend_sis.start_collection_session(api_key, backend_exam_id, session_payload)
     session_id = session.get("session_id") or session.get("id", "")
 
-    # Step 4: Upload one school per chunk
-    # ExaMetrics rate limit is 120 RPM. Pace at ~1 req/sec to stay well under.
+    # Step 4: Upload chunks — ONE session for all cache writes, commit per chunk.
     _CHUNK_DELAY_SECS = 0.75
     schools_done: list[dict] = []
     schools_failed: list[dict] = []
 
-    for i, chunk in enumerate(filtered_payloads):
-        school_info = chunk["schools"][0] if chunk.get("schools") else {}
-        cn = school_info.get("centre_number", f"chunk-{i}")
-        school_name = school_info.get("school_name", "")
+    async with _session_factory() as db:
+        for i, chunk in enumerate(filtered_payloads):
+            school_info = chunk["schools"][0] if chunk.get("schools") else {}
+            cn = school_info.get("centre_number", f"chunk-{i}")
+            school_name = school_info.get("school_name", "")
 
-        task.update_state(state="PROGRESS", meta={
-            "total_schools": total,
-            "completed": i,
-            "phase": "uploading",
-            "current_school": {"centre_number": cn, "name": school_name},
-            "schools_done": schools_done[:],
-            "schools_failed": schools_failed[:],
-        })
+            task.update_state(state="PROGRESS", meta={
+                "total_schools": total,
+                "completed": i,
+                "phase": "uploading",
+                "current_school": {"centre_number": cn, "name": school_name},
+                "schools_done": schools_done[-10:],  # last 10 only to keep meta small
+                "schools_failed": schools_failed[:],
+            })
 
-        # Retry with exponential backoff on rate-limit / transient errors
-        max_retries = 5
-        success = False
-        for attempt in range(max_retries):
-            try:
-                await backend_sis.put_chunk(api_key, session_id, i, chunk)
-                success = True
-                break
-            except Exception as exc:
-                err_msg = str(exc).lower()
-                is_retryable = (
-                    "too many" in err_msg
-                    or "429" in err_msg
-                    or "503" in err_msg
-                    or "timeout" in err_msg
-                    or "unreachable" in err_msg
-                )
-                if is_retryable and attempt < max_retries - 1:
-                    wait = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
-                    logger.warning(
-                        "Retrying school %s (attempt %d/%d) after %ds: %s",
-                        cn, attempt + 1, max_retries, wait, exc,
-                    )
-                    await asyncio.sleep(wait)
-                else:
-                    logger.error("Failed to push school %s: %s", cn, exc)
-                    schools_failed.append({"centre_number": cn, "name": school_name, "error": str(exc)})
+            # Upload chunk with retries
+            max_retries = 5
+            success = False
+            for attempt in range(max_retries):
+                try:
+                    await backend_sis.put_chunk(api_key, session_id, i, chunk)
+                    success = True
                     break
+                except Exception as exc:
+                    err_msg = str(exc).lower()
+                    is_retryable = (
+                        "too many" in err_msg
+                        or "429" in err_msg
+                        or "503" in err_msg
+                        or "timeout" in err_msg
+                        or "unreachable" in err_msg
+                    )
+                    if is_retryable and attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            "Retrying school %s (attempt %d/%d) after %ds: %s",
+                            cn, attempt + 1, max_retries, wait, exc,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.error("Failed to push school %s: %s", cn, exc)
+                        schools_failed.append({"centre_number": cn, "name": school_name, "error": str(exc)})
+                        break
 
-        if success:
-            schools_done.append({"centre_number": cn, "name": school_name})
+            if success:
+                schools_done.append({"centre_number": cn, "name": school_name})
 
-            # Update push cache for this school
-            if i < len(cache_updates_by_school):
-                updates = cache_updates_by_school[i]
-                if updates:
-                    async with async_sessionmaker_factory()() as db:
-                        await upsert_cache(db, exam_uuid, updates, task_id)
-                        await db.commit()
+                # Update push cache and COMMIT immediately — one commit per chunk.
+                if i < len(cache_updates_by_school):
+                    updates = cache_updates_by_school[i]
+                    if updates:
+                        try:
+                            await upsert_cache(db, exam_uuid, updates, task_id)
+                            await db.commit()
+                        except Exception as exc:
+                            logger.warning("Cache update failed for %s (non-fatal): %s", cn, exc)
+                            await db.rollback()
 
             # Throttle to respect ExaMetrics rate limit
             await asyncio.sleep(_CHUNK_DELAY_SECS)
@@ -208,20 +212,22 @@ async def _build_and_push(
         logger.error("Failed to complete collection session: %s", exc)
 
     # Step 6: Update processing link status
-    from ..models.processing import ExamProcessingLink
-    from sqlalchemy import update
-    from datetime import datetime, timezone
     try:
-        async with async_sessionmaker_factory()() as db:
+        async with _session_factory() as db:
             status = "PUSHED" if not schools_failed else "PUSH_PARTIAL"
             await db.execute(
-                update(ExamProcessingLink)
+                sa_update(ExamProcessingLink)
                 .where(ExamProcessingLink.exam_id == exam_uuid)
                 .values(last_status=status, last_submitted_at=datetime.now(timezone.utc))
             )
             await db.commit()
     except Exception as exc:
         logger.warning("Failed to update processing link status: %s", exc)
+
+    # Dispose the engine to release all pooled connections.
+    engine = _session_factory.kw.get("bind")
+    if engine:
+        await engine.dispose()
 
     return {
         "total_schools": total,
