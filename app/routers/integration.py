@@ -353,6 +353,7 @@ async def push_collection_data(
 
     link.last_submitted_at = datetime.now(timezone.utc)
     link.last_status = "PUSHING"
+    link.active_task_id = task.id
     await db.flush()
 
     return {"task_id": task.id, "total_schools": school_count}
@@ -484,24 +485,74 @@ async def push_preview(
 @router.get("/{exam_id}/processing/push-progress")
 async def push_progress(
     exam_id: uuid.UUID,
-    task_id: str,
+    task_id: str | None = None,
     db: AsyncSession = Depends(get_session),
     _: User = Depends(current_user),
 ):
     from celery.result import AsyncResult
     from ..celery_app import celery_app
 
+    # If no task_id provided, look up the persisted one from the link.
+    if not task_id:
+        link = await _get_link(db, exam_id)
+        if link and link.active_task_id:
+            task_id = link.active_task_id
+    if not task_id:
+        return {"state": "IDLE", "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": [], "error": None}
+
     result = AsyncResult(task_id, app=celery_app)
     if result.state == "PENDING":
-        return {"state": "PENDING", "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": [], "error": None}
+        return {"state": "PENDING", "task_id": task_id, "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": [], "error": None}
     elif result.state == "PROGRESS":
-        return {"state": "PROGRESS", **result.info}
+        return {"state": "PROGRESS", "task_id": task_id, **result.info}
     elif result.state == "SUCCESS":
-        return {"state": "SUCCESS", **result.result}
+        return {"state": "SUCCESS", "task_id": task_id, **result.result}
     elif result.state == "FAILURE":
-        return {"state": "FAILURE", "error": str(result.result), "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": []}
+        return {"state": "FAILURE", "task_id": task_id, "error": str(result.result), "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": []}
+    elif result.state == "REVOKED":
+        return {"state": "CANCELLED", "task_id": task_id, "error": "Push was cancelled.", "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": []}
     else:
-        return {"state": result.state, "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": [], "error": None}
+        return {"state": result.state, "task_id": task_id, "total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": [], "error": None}
+
+
+@router.post("/{exam_id}/processing/push-cancel")
+async def cancel_push(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(require_exam_admin()),
+):
+    """Cancel a running push task."""
+    from celery.result import AsyncResult
+    from ..celery_app import celery_app
+    from sqlalchemy import update as sa_update
+
+    link = await _get_link(db, exam_id)
+    task_id = link.active_task_id if link else None
+    if not task_id:
+        raise HTTPException(404, detail="No active push task found.")
+
+    result = AsyncResult(task_id, app=celery_app)
+    if result.state in ("SUCCESS", "FAILURE", "REVOKED"):
+        # Clear DB state so UI doesn't keep polling
+        await db.execute(
+            sa_update(ExamProcessingLink)
+            .where(ExamProcessingLink.exam_id == exam_id)
+            .values(last_status="IDLE", active_task_id=None)
+        )
+        await db.commit()
+        return {"status": "already_finished", "state": result.state, "task_id": task_id}
+
+    celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+
+    # Clear DB state so UI stops polling on next page load
+    await db.execute(
+        sa_update(ExamProcessingLink)
+        .where(ExamProcessingLink.exam_id == exam_id)
+        .values(last_status="IDLE", active_task_id=None)
+    )
+    await db.commit()
+
+    return {"status": "cancelled", "task_id": task_id}
 
 
 @router.post("/{exam_id}/processing/submit", response_model=ExamOut)

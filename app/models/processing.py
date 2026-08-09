@@ -58,6 +58,9 @@ class ExamProcessingLink(Base, TimestampMixin):
 
     last_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # Celery task ID of the currently-running push task. Persisted so the
+    # frontend can resume progress polling after a page refresh.
+    active_task_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     configured_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
     # Cached capabilities response from GET /integration/me.

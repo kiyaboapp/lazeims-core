@@ -140,8 +140,10 @@ async def _build_and_push(
 
     # Step 4: Upload chunks — ONE session for all cache writes, commit per chunk.
     _CHUNK_DELAY_SECS = 0.75
+    _CONSECUTIVE_FAIL_ABORT = 5  # Abort if N consecutive schools fail (server likely down)
     schools_done: list[dict] = []
     schools_failed: list[dict] = []
+    consecutive_failures = 0
 
     async with _session_factory() as db:
         for i, chunk in enumerate(filtered_payloads):
@@ -159,7 +161,7 @@ async def _build_and_push(
             })
 
             # Upload chunk with retries
-            max_retries = 5
+            max_retries = 3 if consecutive_failures == 0 else 1
             success = False
             for attempt in range(max_retries):
                 try:
@@ -188,6 +190,7 @@ async def _build_and_push(
                         break
 
             if success:
+                consecutive_failures = 0
                 schools_done.append({"centre_number": cn, "name": school_name})
 
                 # Update push cache and COMMIT immediately — one commit per chunk.
@@ -200,6 +203,19 @@ async def _build_and_push(
                         except Exception as exc:
                             logger.warning("Cache update failed for %s (non-fatal): %s", cn, exc)
                             await db.rollback()
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= _CONSECUTIVE_FAIL_ABORT:
+                    logger.error(
+                        "Aborting push: %d consecutive schools failed — ExaMetrics likely unreachable.",
+                        consecutive_failures,
+                    )
+                    schools_failed.append({
+                        "centre_number": "—",
+                        "name": f"ABORTED: {total - i - 1} remaining schools skipped (server unreachable)",
+                        "error": "Push aborted after consecutive failures.",
+                    })
+                    break
 
             # Throttle to respect ExaMetrics rate limit
             await asyncio.sleep(_CHUNK_DELAY_SECS)
@@ -211,14 +227,18 @@ async def _build_and_push(
     except Exception as exc:
         logger.error("Failed to complete collection session: %s", exc)
 
-    # Step 6: Update processing link status
+    # Step 6: Update processing link status and clear active_task_id
     try:
         async with _session_factory() as db:
             status = "PUSHED" if not schools_failed else "PUSH_PARTIAL"
             await db.execute(
                 sa_update(ExamProcessingLink)
                 .where(ExamProcessingLink.exam_id == exam_uuid)
-                .values(last_status=status, last_submitted_at=datetime.now(timezone.utc))
+                .values(
+                    last_status=status,
+                    last_submitted_at=datetime.now(timezone.utc),
+                    active_task_id=None,
+                )
             )
             await db.commit()
     except Exception as exc:
