@@ -1,17 +1,8 @@
 """Celery task for chunked collection push to ExaMetrics, one school at a time.
 
-All heavy work happens here — the API endpoint just validates access and
-dispatches this task. The task:
-1. Builds payloads per-school (streaming, not all at once)
-2. Computes diffs against the push cache
-3. Starts a collection session on ExaMetrics
-4. Uploads one school per chunk
-5. Updates the push cache after each successful chunk (single session, commit per chunk)
-6. Reports progress throughout
-
-Connection discipline: ONE engine, ONE session for the entire task. The session
-is committed after each chunk's cache update so we never hold a long transaction
-and never leak connections — even for 1750+ schools.
+STREAMING: never holds more than one school's data in memory. The old approach
+loaded all 1750 schools (772K rows) at once and got OOM-killed on a 3.3GB server.
+Now each school is: query → diff → upload → free.
 """
 from __future__ import annotations
 
@@ -33,7 +24,6 @@ async def _build_and_push(
     task: Any,
     task_id: str,
 ) -> dict:
-    """Build payloads per-school and push each one as a chunk."""
     from sqlalchemy import update as sa_update
     from datetime import datetime, timezone
 
@@ -44,23 +34,25 @@ async def _build_and_push(
         load_cache,
         upsert_cache,
     )
-    from ..services.processing_submit import build_school_payloads
+    from ..services.processing_submit import (
+        build_single_school_payload,
+        get_exam_subjects,
+        iter_school_centre_numbers,
+    )
     from ..db import async_sessionmaker_factory
     from ..models.exam import Exam
     from ..models.processing import ExamProcessingLink
     from lazeims_common.exametrics_digest import collection_digest, merge_chunks
 
     exam_uuid = uuid.UUID(exam_id)
-
-    # ONE engine/pool for the entire task.
     _session_factory = async_sessionmaker_factory()
 
-    # Step 1: Build per-school payloads
     task.update_state(state="PROGRESS", meta={
-        "total_schools": 0, "completed": 0, "phase": "building",
+        "total_schools": 0, "completed": 0, "phase": "preparing",
         "current_school": None, "schools_done": [], "schools_failed": [],
     })
 
+    # ── Step 1: lightweight queries (school list, subjects, cache) ──
     async with _session_factory() as db:
         exam = await db.get(Exam, exam_uuid)
         if not exam:
@@ -85,10 +77,9 @@ async def _build_and_push(
         except Exception as exc:
             logger.warning("Exam definition sync failed (non-fatal): %s", exc)
 
-        # Build payloads
-        school_payloads = await build_school_payloads(db, exam, skip_empty=True)
+        school_list = await iter_school_centre_numbers(db, exam, skip_empty=True)
+        subjects = await get_exam_subjects(db, exam)
 
-        # Load/clear cache
         if force:
             await clear_cache(db, exam_uuid)
             await db.commit()
@@ -96,20 +87,7 @@ async def _build_and_push(
         else:
             cache = await load_cache(db, exam_uuid)
 
-    # Step 2: Filter by diff (pure computation, no DB)
-    filtered_payloads: list[dict] = []
-    cache_updates_by_school: list[list[tuple]] = []
-
-    for payload in school_payloads:
-        filtered, updates = filter_school_payload_by_diff(payload, cache)
-        if filtered is None:
-            continue
-        filtered_payloads.append(filtered)
-        cache_updates_by_school.append(updates)
-
-    del school_payloads  # free memory
-
-    total = len(filtered_payloads)
+    total = len(school_list)
     if total == 0:
         try:
             async with _session_factory() as db:
@@ -121,26 +99,73 @@ async def _build_and_push(
                 await db.commit()
         except Exception:
             pass
-        return {
-            "total_schools": 0, "completed": 0,
-            "schools_done": [], "schools_failed": [],
-            "status": "no_changes",
-        }
+        return {"total_schools": 0, "completed": 0, "schools_done": [], "schools_failed": [], "status": "no_changes"}
 
-    # Step 3: Start collection session on ExaMetrics
+    # ── Step 2: stream schools — build+diff one at a time ──
     task.update_state(state="PROGRESS", meta={
-        "total_schools": total, "completed": 0, "phase": "uploading",
+        "total_schools": total, "completed": 0, "phase": "diffing",
+        "current_school": None, "schools_done": [], "schools_failed": [],
+    })
+
+    filtered_payloads: list[dict] = []
+    cache_updates_by_school: list[list[tuple]] = []
+    first_chunk = True
+
+    async with _session_factory() as db:
+        for i, (cn, school_name) in enumerate(school_list):
+            payload = await build_single_school_payload(db, exam, cn)
+
+            if first_chunk:
+                payload["subjects"] = subjects
+
+            filtered, updates = filter_school_payload_by_diff(payload, cache)
+            del payload  # free immediately
+
+            if filtered is None:
+                continue
+
+            if first_chunk:
+                first_chunk = False
+
+            filtered_payloads.append(filtered)
+            cache_updates_by_school.append(updates)
+
+            if i % 100 == 0:
+                task.update_state(state="PROGRESS", meta={
+                    "total_schools": total, "completed": 0,
+                    "phase": f"diffing ({i}/{total})",
+                    "current_school": {"centre_number": cn, "name": school_name},
+                    "schools_done": [], "schools_failed": [],
+                })
+
+    total_to_push = len(filtered_payloads)
+    if total_to_push == 0:
+        try:
+            async with _session_factory() as db:
+                await db.execute(
+                    sa_update(ExamProcessingLink)
+                    .where(ExamProcessingLink.exam_id == exam_uuid)
+                    .values(last_status="IDLE")
+                )
+                await db.commit()
+        except Exception:
+            pass
+        return {"total_schools": total, "completed": 0, "schools_done": [], "schools_failed": [], "status": "no_changes"}
+
+    # ── Step 3: start ExaMetrics session ──
+    task.update_state(state="PROGRESS", meta={
+        "total_schools": total_to_push, "completed": 0, "phase": "uploading",
         "current_school": None, "schools_done": [], "schools_failed": [],
     })
 
     digest = collection_digest(merge_chunks(filtered_payloads))
-    session_payload = {"chunk_count": total, "expected_digest": digest}
+    session_payload = {"chunk_count": total_to_push, "expected_digest": digest}
     session = await backend_sis.start_collection_session(api_key, backend_exam_id, session_payload)
     session_id = session.get("session_id") or session.get("id", "")
 
-    # Step 4: Upload chunks — ONE session for all cache writes, commit per chunk.
+    # ── Step 4: upload chunks ──
     _CHUNK_DELAY_SECS = 0.75
-    _CONSECUTIVE_FAIL_ABORT = 5  # Abort if N consecutive schools fail (server likely down)
+    _CONSECUTIVE_FAIL_ABORT = 5
     schools_done: list[dict] = []
     schools_failed: list[dict] = []
     consecutive_failures = 0
@@ -152,15 +177,14 @@ async def _build_and_push(
             school_name = school_info.get("school_name", "")
 
             task.update_state(state="PROGRESS", meta={
-                "total_schools": total,
+                "total_schools": total_to_push,
                 "completed": i,
                 "phase": "uploading",
                 "current_school": {"centre_number": cn, "name": school_name},
-                "schools_done": schools_done[-10:],  # last 10 only to keep meta small
+                "schools_done": schools_done[-10:],
                 "schools_failed": schools_failed[:],
             })
 
-            # Upload chunk with retries
             max_retries = 3 if consecutive_failures == 0 else 1
             success = False
             for attempt in range(max_retries):
@@ -170,20 +194,9 @@ async def _build_and_push(
                     break
                 except Exception as exc:
                     err_msg = str(exc).lower()
-                    is_retryable = (
-                        "too many" in err_msg
-                        or "429" in err_msg
-                        or "503" in err_msg
-                        or "timeout" in err_msg
-                        or "unreachable" in err_msg
-                    )
+                    is_retryable = any(s in err_msg for s in ("too many", "429", "503", "timeout", "unreachable"))
                     if is_retryable and attempt < max_retries - 1:
-                        wait = 2 ** attempt
-                        logger.warning(
-                            "Retrying school %s (attempt %d/%d) after %ds: %s",
-                            cn, attempt + 1, max_retries, wait, exc,
-                        )
-                        await asyncio.sleep(wait)
+                        await asyncio.sleep(2 ** attempt)
                     else:
                         logger.error("Failed to push school %s: %s", cn, exc)
                         schools_failed.append({"centre_number": cn, "name": school_name, "error": str(exc)})
@@ -192,8 +205,6 @@ async def _build_and_push(
             if success:
                 consecutive_failures = 0
                 schools_done.append({"centre_number": cn, "name": school_name})
-
-                # Update push cache and COMMIT immediately — one commit per chunk.
                 if i < len(cache_updates_by_school):
                     updates = cache_updates_by_school[i]
                     if updates:
@@ -201,56 +212,46 @@ async def _build_and_push(
                             await upsert_cache(db, exam_uuid, updates, task_id)
                             await db.commit()
                         except Exception as exc:
-                            logger.warning("Cache update failed for %s (non-fatal): %s", cn, exc)
+                            logger.warning("Cache update failed for %s: %s", cn, exc)
                             await db.rollback()
             else:
                 consecutive_failures += 1
                 if consecutive_failures >= _CONSECUTIVE_FAIL_ABORT:
-                    logger.error(
-                        "Aborting push: %d consecutive schools failed — ExaMetrics likely unreachable.",
-                        consecutive_failures,
-                    )
+                    logger.error("Aborting: %d consecutive failures", consecutive_failures)
                     schools_failed.append({
                         "centre_number": "—",
-                        "name": f"ABORTED: {total - i - 1} remaining schools skipped (server unreachable)",
+                        "name": f"ABORTED: {total_to_push - i - 1} remaining schools skipped",
                         "error": "Push aborted after consecutive failures.",
                     })
                     break
 
-            # Throttle to respect ExaMetrics rate limit
             await asyncio.sleep(_CHUNK_DELAY_SECS)
 
-    # Step 5: Complete session
+    # ── Step 5: complete session ──
     try:
-        complete_payload = {"digest": digest}
-        await backend_sis.complete_collection_session(api_key, session_id, complete_payload)
+        await backend_sis.complete_collection_session(api_key, session_id, {"digest": digest})
     except Exception as exc:
         logger.error("Failed to complete collection session: %s", exc)
 
-    # Step 6: Update processing link status and clear active_task_id
+    # ── Step 6: update status ──
     try:
         async with _session_factory() as db:
             status = "PUSHED" if not schools_failed else "PUSH_PARTIAL"
             await db.execute(
                 sa_update(ExamProcessingLink)
                 .where(ExamProcessingLink.exam_id == exam_uuid)
-                .values(
-                    last_status=status,
-                    last_submitted_at=datetime.now(timezone.utc),
-                    active_task_id=None,
-                )
+                .values(last_status=status, last_submitted_at=datetime.now(timezone.utc), active_task_id=None)
             )
             await db.commit()
     except Exception as exc:
         logger.warning("Failed to update processing link status: %s", exc)
 
-    # Dispose the engine to release all pooled connections.
     engine = _session_factory.kw.get("bind")
     if engine:
         await engine.dispose()
 
     return {
-        "total_schools": total,
+        "total_schools": total_to_push,
         "completed": len(schools_done),
         "schools_done": schools_done,
         "schools_failed": schools_failed,
@@ -264,28 +265,17 @@ def push_collection_chunked(
     api_key: str,
     backend_exam_id: str,
     force: bool = False,
-    # Legacy args (ignored — task now builds its own payloads)
     school_payloads: list[dict] | None = None,
     cache_updates_by_school: list[list[tuple]] | None = None,
 ) -> dict:
-    """Push collection data to ExaMetrics one school at a time.
-
-    Builds payloads, computes diffs, uploads chunks, and reports progress.
-    All heavy work happens here — the API endpoint is lightweight.
-    """
+    """Push collection data to ExaMetrics one school at a time (streaming)."""
     self.update_state(
         state="STARTED",
         meta={"total_schools": 0, "completed": 0, "phase": "starting", "schools_done": [], "schools_failed": []},
     )
-
-    result = asyncio.run(
+    return asyncio.run(
         _build_and_push(
-            exam_id=exam_id,
-            api_key=api_key,
-            backend_exam_id=backend_exam_id,
-            force=force,
-            task=self,
-            task_id=self.request.id or "",
+            exam_id=exam_id, api_key=api_key, backend_exam_id=backend_exam_id,
+            force=force, task=self, task_id=self.request.id or "",
         )
     )
-    return result

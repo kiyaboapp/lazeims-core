@@ -10,7 +10,7 @@ celery_app.conf.update(
     result_serializer="json",
     accept_content=["json"],
     task_track_started=True,
-    result_expires=3600,  # 1 hour
+    result_expires=86400,  # 24 hours
 )
 celery_app.autodiscover_tasks(["app.tasks"])
 
