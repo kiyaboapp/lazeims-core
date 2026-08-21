@@ -50,6 +50,7 @@ async def collection_progress(db: AsyncSession, *, exam: Exam) -> dict[str, Any]
         return {
             "scope_count": 0,
             "expected_total": 0,
+            "markable_total": 0,
             "entered_total": 0,
             "attendance_total": 0,
             "finalized_count": 0,
@@ -76,7 +77,7 @@ async def collection_progress(db: AsyncSession, *, exam: Exam) -> dict[str, Any]
 
     if not scope_keys:
         return {
-            "scope_count": 0, "expected_total": 0, "entered_total": 0,
+            "scope_count": 0, "expected_total": 0, "markable_total": 0, "entered_total": 0,
             "attendance_total": 0, "finalized_count": 0, "blocked_count": 0,
             "by_writer_mode": {}, "scopes": [],
         }
@@ -273,6 +274,10 @@ async def collection_progress(db: AsyncSession, *, exam: Exam) -> dict[str, Any]
     return {
         "scope_count": len(scopes),
         "expected_total": sum(s["expected"] for s in scopes),
+        # Marks can only exist for candidates who sat. Absentees are in `expected`
+        # but not in `markable`, so `markable_total` is the correct denominator for
+        # "how much of the collectable data has arrived".
+        "markable_total": sum(s["markable"] for s in scopes),
         "entered_total": sum(s["entered"] for s in scopes),
         "attendance_total": sum(s["attendance_transcribed"] for s in scopes),
         "finalized_count": sum(1 for s in scopes if s["finalized"]),

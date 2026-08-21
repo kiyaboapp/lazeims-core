@@ -94,33 +94,97 @@ async def compute_readiness(db: AsyncSession, exam: Exam) -> Readiness:
     not_final = expected - finalized
     evidence["finalized_scope_count"] = len(finalized)
     if not_final:
+        # Resolve human-identifiable labels so the UI can list and link each problem
+        # rather than showing only a count.
+        school_ids = {s for s, _, _ in not_final}
+        es_ids = {e for _, e, _ in not_final}
+        school_rows = (await db.execute(
+            select(School.id, School.name, School.centre_number)
+            .where(School.id.in_(school_ids)))).all() if school_ids else []
+        schools_by_id = {r[0]: {"name": r[1], "centre_number": r[2]} for r in school_rows}
+        subj_rows = (await db.execute(
+            select(ExamSubject.id, Subject.name, Subject.code)
+            .join(Subject, Subject.id == ExamSubject.subject_id)
+            .where(ExamSubject.id.in_(es_ids)))).all() if es_ids else []
+        subjects_by_es = {r[0]: {"name": r[1], "code": r[2]} for r in subj_rows}
+
+        items = []
+        for school_id, es_id, paper in sorted(
+            not_final,
+            key=lambda t: (
+                schools_by_id.get(t[0], {}).get("centre_number") or "",
+                subjects_by_es.get(t[1], {}).get("code") or "",
+                t[2],
+            ),
+        ):
+            school = schools_by_id.get(school_id, {})
+            subject = subjects_by_es.get(es_id, {})
+            items.append({
+                "school_id": school_id,
+                "school_name": school.get("name"),
+                "centre_number": school.get("centre_number"),
+                "exam_subject_id": es_id,
+                "subject_name": subject.get("name"),
+                "subject_code": subject.get("code"),
+                "paper": paper,
+            })
+
         blockers.append({"code": "SCOPE_NOT_FINALIZED",
                          "message": f"{len(not_final)} required scope(s) are not finalized.",
-                         "evidence": {"unfinalized_count": len(not_final)}})
+                         "evidence": {"unfinalized_count": len(not_final),
+                                      "items": items}})
 
     # unresolved incidents
-    open_incidents = await db.scalar(
-        select(func.count()).select_from(ExamIncident).where(
+    incident_rows = (await db.execute(
+        select(ExamIncident).where(
             ExamIncident.exam_id == exam.id,
-            ExamIncident.status.in_(list(IncidentStatus.unresolved()))))
+            ExamIncident.status.in_(list(IncidentStatus.unresolved()))))).scalars().all()
+    open_incidents = len(incident_rows)
     if open_incidents:
+        incident_items = [{
+            "id": inc.id,
+            "status": inc.status.value if hasattr(inc.status, "value") else inc.status,
+            "incident_type": (inc.incident_type.value
+                              if hasattr(inc.incident_type, "value") else inc.incident_type),
+            "explanation": inc.explanation,
+            "school_id": inc.school_id,
+            "exam_subject_id": inc.exam_subject_id,
+            "paper": inc.paper_type.value if hasattr(inc.paper_type, "value") else inc.paper_type,
+            "documented_in_supervisor_cal": inc.documented_in_supervisor_cal,
+        } for inc in incident_rows]
         blockers.append({"code": "UNRESOLVED_INCIDENT",
                          "message": f"{open_incidents} unresolved incident(s) block closeout.",
-                         "evidence": {"open_incidents": open_incidents}})
+                         "evidence": {"open_incidents": open_incidents,
+                                      "items": incident_items}})
 
     # rejected sync events
-    rejected_events = await db.scalar(
-        select(func.count()).select_from(SyncEventReceipt)
+    rejected_rows = (await db.execute(
+        select(SyncEventReceipt.event_id, SyncEventReceipt.entity_type,
+               SyncEventReceipt.rejection_code, SyncEventReceipt.package_id,
+               SyncEventReceipt.received_at, Station.station_code, Station.id)
         .join(Station, Station.id == SyncEventReceipt.station_id)
-        .where(Station.exam_id == exam.id, SyncEventReceipt.status == "REJECTED"))
+        .where(Station.exam_id == exam.id, SyncEventReceipt.status == "REJECTED")
+        .order_by(Station.station_code, SyncEventReceipt.event_id))).all()
+    rejected_events = len(rejected_rows)
     if rejected_events:
+        rejected_items = [{
+            "event_id": r[0],
+            "entity_type": r[1],
+            "rejection_code": r[2],
+            "package_id": r[3],
+            "received_at": r[4].isoformat() if r[4] else None,
+            "station_code": r[5],
+            "station_id": r[6],
+        } for r in rejected_rows]
         blockers.append({"code": "REJECTED_SYNC_EVENTS",
                          "message": f"{rejected_events} rejected sync event(s) must be corrected.",
-                         "evidence": {"rejected_events": rejected_events}})
+                         "evidence": {"rejected_events": rejected_events,
+                                      "items": rejected_items}})
 
     # station reconciliation: every station with a package must have a MATCHED reconciliation
     stations = (await db.execute(select(Station).where(Station.exam_id == exam.id))).scalars().all()
     unreconciled = []
+    unreconciled_items = []
     for st in stations:
         pkg_count = await db.scalar(select(func.count()).select_from(StationPackage).where(
             StationPackage.station_id == st.id))
@@ -130,10 +194,21 @@ async def compute_readiness(db: AsyncSession, exam: Exam) -> Readiness:
             StationReconciliation.station_id == st.id, StationReconciliation.status == "MATCHED"))
         if not matched:
             unreconciled.append(st.station_code)
+            recon_total = await db.scalar(
+                select(func.count()).select_from(StationReconciliation).where(
+                    StationReconciliation.station_id == st.id))
+            unreconciled_items.append({
+                "station_id": st.id,
+                "station_code": st.station_code,
+                "station_name": getattr(st, "name", None),
+                "package_count": pkg_count,
+                "reconciliation_attempts": recon_total or 0,
+            })
     if unreconciled:
         blockers.append({"code": "STATION_NOT_RECONCILED",
                          "message": f"{len(unreconciled)} station(s) not reconciled.",
-                         "evidence": {"stations": unreconciled}})
+                         "evidence": {"stations": unreconciled,
+                                      "items": unreconciled_items}})
 
     return Readiness(ready=not blockers, blockers=blockers, evidence=evidence)
 

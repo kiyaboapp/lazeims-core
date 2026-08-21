@@ -75,6 +75,19 @@ async def test_incomplete_closeout_blocked_with_evidence(client):
     codes = {b["code"] for b in body["blockers"]}
     assert "SCOPE_NOT_FINALIZED" in codes
 
+    # Blockers must carry itemised, human-identifiable evidence so the UI can list
+    # each failing record and link to it, not just show a count.
+    scope_blocker = next(b for b in body["blockers"] if b["code"] == "SCOPE_NOT_FINALIZED")
+    assert scope_blocker["message"]
+    items = scope_blocker["evidence"]["items"]
+    assert len(items) == scope_blocker["evidence"]["unfinalized_count"]
+    assert items[0]["school_id"] == school
+    assert items[0]["centre_number"]
+    assert items[0]["school_name"] == "S"
+    assert items[0]["subject_code"] == "011"
+    assert items[0]["subject_name"] == "H"
+    assert items[0]["paper"]
+
     # sealing is blocked
     s = await client.post(f"/api/v1/exams/{exam_id}/collection-snapshots", headers=h)
     assert s.status_code == 409
