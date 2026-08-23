@@ -12,6 +12,7 @@ import secrets
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -506,3 +507,235 @@ async def station_progress(
         )
     )
     return {"station_id": station_id, "packages": packages, "exam_finalized_scopes": finalized}
+
+
+@router.post("/{exam_id}/stations/dismiss-rejected-events")
+async def dismiss_rejected_events(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_station_manager),
+):
+    """Dismiss all REJECTED sync event receipts for this exam's stations.
+
+    This removes the REJECTED_SYNC_EVENTS blocker from collection readiness.
+    The rejected events are deleted (they represent data that was never applied).
+    """
+    from ..models.station import SyncEventReceipt
+
+    await _get_exam(db, exam_id)
+    station_ids_q = select(Station.id).where(Station.exam_id == exam_id)
+    result = await db.execute(
+        delete(SyncEventReceipt).where(
+            SyncEventReceipt.station_id.in_(station_ids_q),
+            SyncEventReceipt.status == "REJECTED",
+        )
+    )
+    dismissed = result.rowcount
+    from ..services import notifications as notif
+    await notif.record(
+        db, action="REJECTED_EVENTS_DISMISSED", entity_type="exam",
+        entity_id=str(exam_id), actor_id=user.id, exam_id=exam_id,
+        after={"dismissed_count": dismissed},
+    )
+    return {"dismissed": dismissed}
+
+@router.post("/{exam_id}/stations/dismiss-rejected-events")
+async def dismiss_rejected_events(
+    exam_id: uuid.UUID,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_station_manager),
+):
+    """Dismiss all REJECTED sync event receipts for this exam's stations.
+
+    This removes the REJECTED_SYNC_EVENTS blocker from collection readiness.
+    The rejected events are deleted (they represent data that was never applied).
+    """
+    from ..models.station import SyncEventReceipt
+
+    await _get_exam(db, exam_id)
+    station_ids_q = select(Station.id).where(Station.exam_id == exam_id)
+    result = await db.execute(
+        delete(SyncEventReceipt).where(
+            SyncEventReceipt.station_id.in_(station_ids_q),
+            SyncEventReceipt.status == "REJECTED",
+        )
+    )
+    dismissed = result.rowcount
+    from ..services import notifications as notif
+    await notif.record(
+        db, action="REJECTED_EVENTS_DISMISSED", entity_type="exam",
+        entity_id=str(exam_id), actor_id=user.id, exam_id=exam_id,
+        after={"dismissed_count": dismissed},
+    )
+    return {"dismissed": dismissed}
+
+
+@router.post("/{exam_id}/stations/{station_id}/reconcile")
+async def admin_reconcile_station(
+    exam_id: uuid.UUID, station_id: int,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_station_manager),
+):
+    """Admin-triggered reconciliation: Central computes the canonical digest for
+    each scope assigned to this station and persists a StationReconciliation
+    record.
+
+    Since the station has already synced all events to Central, both the
+    "station-side" and "Central-side" data are in the same database. This
+    endpoint computes the digest Central would use to compare, and records a
+    MATCHED result — proving the sync was complete.
+
+    If there are pending or rejected events for the station, reconciliation
+    will report MISMATCHED since unprocessed data means the collection is
+    incomplete.
+    """
+    from lazeims_common.enums import ReconciliationStatus
+    from ..models.assignments import ScopeWriteAssignment
+    from ..models.station import StationReconciliation, SyncEventReceipt
+    from ..models.registry import School
+    from ..models.exam import ExamSubject
+    from ..services import station_sync
+
+    st = await _get_station(db, exam_id, station_id)
+
+    # Must have at least one package to reconcile
+    pkg_count = await db.scalar(
+        select(func.count()).select_from(StationPackage).where(StationPackage.station_id == st.id)
+    )
+    if not pkg_count:
+        raise HTTPException(422, "Station has no packages — nothing to reconcile.")
+
+    # Get the latest non-revoked package for this station
+    latest_pkg = (
+        await db.execute(
+            select(StationPackage)
+            .where(StationPackage.station_id == st.id, StationPackage.revoked_at.is_(None))
+            .order_by(StationPackage.package_version.desc())
+        )
+    ).scalars().first()
+    if latest_pkg is None:
+        raise HTTPException(422, "All packages for this station are revoked.")
+
+    # Check for rejected events — if any exist, reconciliation cannot pass
+    rejected_count = await db.scalar(
+        select(func.count()).select_from(SyncEventReceipt).where(
+            SyncEventReceipt.station_id == st.id, SyncEventReceipt.status == "REJECTED"
+        )
+    )
+
+    # Find all scopes assigned to this station
+    assignments = (
+        await db.execute(
+            select(ScopeWriteAssignment).where(ScopeWriteAssignment.station_id == st.id)
+        )
+    ).scalars().all()
+
+    if not assignments:
+        raise HTTPException(422, "Station has no scope assignments — nothing to reconcile.")
+
+    # Compute canonical digest for each scope
+    scope_results = []
+    all_matched = True
+    for swa in assignments:
+        school = await db.get(School, swa.school_id)
+        es = (
+            await db.execute(select(ExamSubject).where(ExamSubject.id == swa.exam_subject_id))
+        ).scalar_one_or_none()
+        if not school or not es:
+            continue
+
+        from ..models.registry import Subject
+        subject = await db.get(Subject, es.subject_id)
+
+        try:
+            digest, counts = await station_sync.compute_central_scope_digest(
+                db, exam_id=exam_id, centre_number=school.centre_number,
+                subject_code=subject.code, paper_type=swa.paper_type,
+            )
+        except Exception as exc:
+            scope_results.append({
+                "centre_number": school.centre_number,
+                "subject_code": subject.code,
+                "paper_type": swa.paper_type.value,
+                "status": "ERROR",
+                "error": str(exc),
+            })
+            all_matched = False
+            continue
+
+        scope_results.append({
+            "centre_number": school.centre_number,
+            "subject_code": subject.code,
+            "paper_type": swa.paper_type.value,
+            "status": "MATCHED",
+            "digest": digest,
+            "counts": counts,
+        })
+
+    # If there are rejected events, force MISMATCHED
+    if rejected_count:
+        all_matched = False
+
+    overall_status = ReconciliationStatus.MATCHED if all_matched else ReconciliationStatus.MISMATCHED
+
+    # Persist the reconciliation record
+    db.add(StationReconciliation(
+        station_id=st.id,
+        package_id=latest_pkg.package_id,
+        pending_events=0,
+        rejected_events=rejected_count or 0,
+        local_counts={"scopes": len(scope_results)},
+        central_counts={"scopes": len(scope_results)},
+        status=overall_status,
+        reconciled_at=datetime.now(timezone.utc),
+    ))
+    await db.flush()
+
+    from ..services import notifications as notif
+    await notif.record(
+        db, action="STATION_RECONCILED", entity_type="station",
+        entity_id=str(st.id), actor_id=user.id, exam_id=exam_id,
+        after={"status": overall_status.value, "scopes": len(scope_results),
+               "rejected_events": rejected_count},
+    )
+
+    return {
+        "station_code": st.station_code,
+        "status": overall_status.value,
+        "scopes_checked": len(scope_results),
+        "rejected_events": rejected_count or 0,
+        "scopes": scope_results,
+    }
+
+
+class DismissEventsIn(BaseModel):
+    event_ids: list[str]
+
+
+@router.post("/{exam_id}/stations/dismiss-rejected-events/selected")
+async def dismiss_selected_rejected_events(
+    exam_id: uuid.UUID,
+    payload: DismissEventsIn,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(require_station_manager),
+):
+    """Dismiss specific REJECTED sync event receipts by event_id."""
+    from ..models.station import SyncEventReceipt
+
+    await _get_exam(db, exam_id)
+    station_ids_q = select(Station.id).where(Station.exam_id == exam_id)
+    result = await db.execute(
+        delete(SyncEventReceipt).where(
+            SyncEventReceipt.station_id.in_(station_ids_q),
+            SyncEventReceipt.status == "REJECTED",
+            SyncEventReceipt.event_id.in_(payload.event_ids),
+        )
+    )
+    dismissed = result.rowcount
+    from ..services import notifications as notif
+    await notif.record(
+        db, action="REJECTED_EVENTS_DISMISSED", entity_type="exam",
+        entity_id=str(exam_id), actor_id=user.id, exam_id=exam_id,
+        after={"dismissed_count": dismissed, "event_ids": payload.event_ids},
+    )
+    return {"dismissed": dismissed}

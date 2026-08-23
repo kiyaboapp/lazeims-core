@@ -610,10 +610,18 @@ async def submit_for_processing(
 
     payload = await build_collection_payload(db, exam)
     try:
-        await backend_sis.push_collection(link.api_key, link.backend_exam_id, payload)
+        # Try triggering processing directly — data was likely already pushed.
         proc = await backend_sis.trigger_processing(link.api_key, link.backend_exam_id)
     except BackendSisError as exc:
-        raise _sis_http(exc)
+        # If ExaMetrics requires a fresh push before processing, push then trigger.
+        if exc.code and "COLLECTION" in exc.code.upper():
+            try:
+                await backend_sis.push_collection(link.api_key, link.backend_exam_id, payload)
+                proc = await backend_sis.trigger_processing(link.api_key, link.backend_exam_id)
+            except BackendSisError as exc2:
+                raise _sis_http(exc2)
+        else:
+            raise _sis_http(exc)
 
     if exam.phase == ExamPhase.ENTRY_LOCKED:
         try:
@@ -859,7 +867,7 @@ async def create_processing_request(
     try:
         remote = await backend_sis.request_processing(
             link.api_key, link.backend_exam_id,
-            {"closeout_revision": revision, "configuration_hash": config_hash},
+            {"closeout_revision": revision, "configuration_hash": config_hash, "external_ref": str(exam_id)},
         )
     except BackendSisError as exc:
         raise _sis_http(exc)

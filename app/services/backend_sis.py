@@ -117,8 +117,14 @@ def _extract_error(resp: httpx.Response) -> BackendSisError:
             details = detail.get("details")
         elif isinstance(detail, str):
             message = detail
+        elif isinstance(detail, list):
+            # Pydantic/FastAPI validation errors: extract human-readable messages.
+            msgs = [str(item.get("msg", "")) for item in detail if isinstance(item, dict)]
+            message = "; ".join(msgs) if msgs else "Validation failed."
+            code = "VALIDATION_ERROR"
+            details = detail
         else:
-            message = str(body)
+            message = body.get("message") or "Unexpected error from ExaMetrics."
     else:
         message = str(body) if body else "Unexpected response from ExaMetrics."
 

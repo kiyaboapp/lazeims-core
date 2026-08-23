@@ -62,6 +62,7 @@ async def create_snapshot(exam_id: uuid.UUID, db: AsyncSession = Depends(get_ses
             409,
             detail={
                 "code": "CLOSEOUT_BLOCKED",
+                "message": f"Entry must be locked before sealing. Current phase: {exam.phase.value}.",
                 "blockers": [{"code": "PHASE_NOT_ENTRY_LOCKED", "detail": f"current: {exam.phase.value}"}],
                 "evidence": {},
             },
@@ -70,7 +71,7 @@ async def create_snapshot(exam_id: uuid.UUID, db: AsyncSession = Depends(get_ses
     try:
         snap = await closeout.seal_snapshot(db, exam, sealed_by=user.id)
     except closeout.CloseoutBlocked as exc:
-        raise HTTPException(409, detail={"code": "CLOSEOUT_BLOCKED", "blockers": exc.blockers, "evidence": exc.evidence})
+        raise HTTPException(409, detail={"code": "CLOSEOUT_BLOCKED", "message": f"{len(exc.blockers)} requirement(s) still blocking. Check the validation page.", "blockers": exc.blockers, "evidence": exc.evidence})
     from ..services import notifications as notif
     await notif.record(db, action="COLLECTION_SEALED", entity_type="collection_snapshot",
                        entity_id=snap.snapshot_id, actor_id=user.id, exam_id=exam_id,
