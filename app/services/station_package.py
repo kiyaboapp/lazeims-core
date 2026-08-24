@@ -47,6 +47,7 @@ from ..models.exam import (
     ExamSubject,
 )
 from ..models.registry import Council, Region, School, Subject
+from ..models.marks import ItemMark, TotalMark
 from ..models.scoring import Question, QuestionGroup, QuestionTopic
 from ..models.station import StationMachineCredential, StationPackage
 from ..security import hash_secret
@@ -325,6 +326,69 @@ async def build_package_seed(
         for e in ess_rows
     ]
 
+    # ── Marks data (existing marks for in-scope students) ────────────────
+    ess_ids = [e.id for e in ess_rows]
+    # Build a map from ESS id to (student_id, subject_code) natural keys
+    ess_natural_keys: dict[int, tuple[str, str]] = {}
+    for e in ess_rows:
+        student = student_by_id[e.exam_student_id]
+        subj = subject_by_id[e.exam_subject_id]
+        ess_natural_keys[e.id] = (student.student_id, subj.code)
+
+    marks_out: list[dict] = []
+    item_marks_out: list[dict] = []
+
+    if ess_ids:
+        total_mark_rows = (
+            await db.execute(
+                select(TotalMark).where(
+                    TotalMark.exam_student_subject_id.in_(ess_ids),
+                )
+            )
+        ).scalars().all()
+
+        for tm in total_mark_rows:
+            nk = ess_natural_keys.get(tm.exam_student_subject_id)
+            if nk:
+                marks_out.append({
+                    "student_id": nk[0],
+                    "subject_code": nk[1],
+                    "paper_type": tm.paper_type.value if hasattr(tm.paper_type, 'value') else str(tm.paper_type),
+                    "total_marks_obtained": float(tm.total_marks_obtained),
+                })
+
+        item_mark_rows = (
+            await db.execute(
+                select(ItemMark).where(
+                    ItemMark.exam_student_subject_id.in_(ess_ids),
+                )
+            )
+        ).scalars().all()
+
+        # Pre-fetch questions for item marks to get question_number and paper_type
+        question_ids = {im.question_id for im in item_mark_rows}
+        if question_ids:
+            q_rows = (
+                await db.execute(
+                    select(Question).where(Question.id.in_(question_ids))
+                )
+            ).scalars().all()
+            question_map = {q.id: q for q in q_rows}
+        else:
+            question_map = {}
+
+        for im in item_mark_rows:
+            nk = ess_natural_keys.get(im.exam_student_subject_id)
+            q = question_map.get(im.question_id)
+            if nk and q:
+                item_marks_out.append({
+                    "student_id": nk[0],
+                    "subject_code": nk[1],
+                    "paper_type": q.paper_type.value if hasattr(q.paper_type, 'value') else str(q.paper_type),
+                    "question_number": q.question_number,
+                    "marks_obtained": float(im.marks_obtained),
+                })
+
     subjects_out: list[dict] = []
     for es in exam_subjects:
         subj = subject_by_id[es.id]
@@ -414,6 +478,8 @@ async def build_package_seed(
         "subjects": subjects_out,
         "students": students_out,
         "registrations": registrations_out,
+        "marks": marks_out,
+        "item_marks": item_marks_out,
         "credentials": credentials_out,
         # explicit assertion: no processing key is ever included
         "processing_api_key": None,
